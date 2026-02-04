@@ -17,40 +17,22 @@ def find_patterns(game_states: list) -> dict:
     if len(game_states) < 2:
         return patterns
     
-    # Build a lookup of RAW max percent by timestamp range
-    # This ensures we capture peak values that smoothing might remove
-    raw_p1_max_by_time = {}  # timestamp -> max p1 percent in preceding window
-    raw_p2_max_by_time = {}  # timestamp -> max p2 percent in preceding window
-    
-    running_p1_max = 0
-    running_p2_max = 0
-    last_p1_reset = 0  # timestamp of last percent reset (death)
-    last_p2_reset = 0
-    
-    for state in game_states:
-        t = state["timestamp"]
-        p1 = state.get("p1_percent")
-        p2 = state.get("p2_percent")
+    # Helper function to find max percent in a lookback window from RAW data
+    def get_raw_max_before(player: str, end_idx: int, lookback_frames: int = 60) -> float:
+        """Find the max percent for a player in the raw data before the given index."""
+        max_pct = 0
+        start_idx = max(0, end_idx - lookback_frames)
+        pct_key = f"{player}_percent"
         
-        # Track max for P1 (reset when percent drops significantly = death)
-        if p1 is not None:
-            if p1 < 20 and running_p1_max > 50:
-                # Death occurred - record max and reset
-                last_p1_reset = t
-                running_p1_max = p1
-            else:
-                running_p1_max = max(running_p1_max, p1)
-        raw_p1_max_by_time[t] = running_p1_max
-        
-        # Track max for P2 (reset when percent drops significantly = death)
-        if p2 is not None:
-            if p2 < 20 and running_p2_max > 50:
-                # Death occurred - record max and reset
-                last_p2_reset = t
-                running_p2_max = p2
-            else:
-                running_p2_max = max(running_p2_max, p2)
-        raw_p2_max_by_time[t] = running_p2_max
+        for j in range(start_idx, end_idx):
+            if j < len(game_states):
+                pct = game_states[j].get(pct_key)
+                if pct is not None and pct > max_pct:
+                    max_pct = pct
+        return max_pct
+    
+    # Build index mapping from timestamp to raw data index
+    timestamp_to_raw_idx = {state["timestamp"]: i for i, state in enumerate(game_states)}
     
     # first, smooth out the game states to reduce noise
     smoothed_states = smooth_game_states(game_states)
@@ -282,23 +264,27 @@ def find_patterns(game_states: list) -> dict:
         )
         
         if stock_loss_detected:
-            # Use RAW max percent (not smoothed) for accurate death percent
-            raw_p1_max = raw_p1_max_by_time.get(timestamp, p1_max_recent_percent)
+            # Use RAW max percent from lookback window (not smoothed) for accurate death percent
+            raw_idx = timestamp_to_raw_idx.get(timestamp, i)
+            raw_p1_max = get_raw_max_before("p1", raw_idx)
+            actual_percent = raw_p1_max if raw_p1_max > 0 else p1_max_recent_percent
             patterns["stock_losses"].append({
                 "timestamp": timestamp,
-                "percent": raw_p1_max,
+                "percent": actual_percent,
                 "stocks_remaining": stock_loss_detected["new_stocks"]
             })
             confirmed_p1_stocks = stock_loss_detected["new_stocks"]
             p1_max_recent_percent = 0
             prev_p1_percent = 0
         elif percent_reset_death:
-            # Use fallback detection with raw max
+            # Use fallback detection with raw max lookback
             confirmed_p1_stocks = max(0, confirmed_p1_stocks - 1)
-            raw_p1_max = raw_p1_max_by_time.get(timestamp, percent_reset_death["death_percent"])
+            raw_idx = timestamp_to_raw_idx.get(timestamp, i)
+            raw_p1_max = get_raw_max_before("p1", raw_idx)
+            actual_percent = raw_p1_max if raw_p1_max > 0 else percent_reset_death["death_percent"]
             patterns["stock_losses"].append({
                 "timestamp": timestamp,
-                "percent": raw_p1_max,
+                "percent": actual_percent,
                 "stocks_remaining": confirmed_p1_stocks
             })
             p1_max_recent_percent = 0
@@ -316,11 +302,13 @@ def find_patterns(game_states: list) -> dict:
         )
         
         if opp_stock_loss:
-            # Use RAW max percent (not smoothed) for accurate kill percent
-            raw_p2_max = raw_p2_max_by_time.get(timestamp, p2_max_recent_percent)
+            # Use RAW max percent from lookback window (not smoothed) for accurate kill percent
+            raw_idx = timestamp_to_raw_idx.get(timestamp, i)
+            raw_p2_max = get_raw_max_before("p2", raw_idx)
+            actual_percent = raw_p2_max if raw_p2_max > 0 else p2_max_recent_percent
             patterns["kills"].append({
                 "timestamp": timestamp,
-                "opponent_percent": raw_p2_max,
+                "opponent_percent": actual_percent,
                 "opponent_stocks_remaining": opp_stock_loss["new_stocks"]
             })
             confirmed_p2_stocks = opp_stock_loss["new_stocks"]
@@ -328,10 +316,12 @@ def find_patterns(game_states: list) -> dict:
             prev_p2_percent = 0
         elif opp_percent_reset:
             confirmed_p2_stocks = max(0, confirmed_p2_stocks - 1)
-            raw_p2_max = raw_p2_max_by_time.get(timestamp, opp_percent_reset["death_percent"])
+            raw_idx = timestamp_to_raw_idx.get(timestamp, i)
+            raw_p2_max = get_raw_max_before("p2", raw_idx)
+            actual_percent = raw_p2_max if raw_p2_max > 0 else opp_percent_reset["death_percent"]
             patterns["kills"].append({
                 "timestamp": timestamp,
-                "opponent_percent": raw_p2_max,
+                "opponent_percent": actual_percent,
                 "opponent_stocks_remaining": confirmed_p2_stocks
             })
             p2_max_recent_percent = 0
