@@ -10,7 +10,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+# ThreadPoolExecutor removed - using sequential processing to avoid rate limits
 from dataclasses import dataclass
 from typing import List, Optional, Callable
 import time
@@ -60,31 +60,31 @@ def extract_frames_cloud_v2(
     if not frames:
         return []
     
+    import time as time_module
+    
     # Create batches
     batches = [frames[i:i+batch_size] for i in range(0, len(frames), batch_size)]
-    print(f"[CloudExtractor v2] Processing {len(batches)} batches")
+    print(f"[CloudExtractor v2] Processing {len(batches)} batches SEQUENTIALLY with 4s delay")
     
-    # Process batches
+    # Process batches SEQUENTIALLY with delay to avoid rate limits
     all_states = []
     
-    with ThreadPoolExecutor(max_workers=max_parallel_batches) as executor:
-        futures = {
-            executor.submit(_process_batch, batch, idx): idx
-            for idx, batch in enumerate(batches)
-        }
-        
-        for future in as_completed(futures):
-            batch_idx = futures[future]
-            try:
-                states = future.result()
-                all_states.extend(states)
+    for batch_idx, batch in enumerate(batches):
+        try:
+            states = _process_batch(batch, batch_idx)
+            all_states.extend(states)
+            
+            if progress_callback:
+                progress_callback((batch_idx + 1) / len(batches) * 0.9)
+            
+            print(f"[CloudExtractor v2] Batch {batch_idx + 1}/{len(batches)}: {len(states)} states")
+            
+            # Wait between batches to respect rate limits (Gemini free tier: ~15 req/min)
+            if batch_idx < len(batches) - 1:
+                time_module.sleep(4)  # 4 seconds between batches = 15 req/min
                 
-                if progress_callback:
-                    progress_callback((batch_idx + 1) / len(batches) * 0.9)
-                
-                print(f"[CloudExtractor v2] Batch {batch_idx + 1}/{len(batches)}: {len(states)} states")
-            except Exception as e:
-                print(f"[CloudExtractor v2] Batch {batch_idx} error: {e}")
+        except Exception as e:
+            print(f"[CloudExtractor v2] Batch {batch_idx} error: {e}")
     
     # Sort by timestamp
     all_states.sort(key=lambda s: s["timestamp"])
