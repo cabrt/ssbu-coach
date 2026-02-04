@@ -49,22 +49,25 @@ def process_video(
         os.getenv("GEMINI_API_KEY")
     )
     
-    # Try cloud extraction first
+    # Try cloud extraction first (v2 with improved accuracy)
     if prefer_cloud and has_cloud_key and not force_local:
         try:
-            print("[VideoProcessor] Attempting cloud extraction (Gemini 1.5 Flash)...")
-            from cv.cloud_extractor import extract_frames_cloud
+            print("[VideoProcessor] Attempting cloud extraction v2 (Gemini 1.5 Flash)...")
+            from cv.cloud_extractor_v2 import extract_frames_cloud_v2
             
-            states = extract_frames_cloud(
+            # Use 1.0 fps for better accuracy (was 0.5)
+            actual_fps = max(fps_sample, 1.0)
+            
+            states = extract_frames_cloud_v2(
                 video_path=video_path,
-                fps_sample=fps_sample,
+                fps_sample=actual_fps,
                 progress_callback=progress_callback,
                 max_duration=max_duration
             )
             
             if states:
-                print(f"[VideoProcessor] Cloud extraction successful: {len(states)} states")
-                return _apply_smoothing(states)
+                print(f"[VideoProcessor] Cloud extraction v2 successful: {len(states)} states")
+                return states  # v2 already applies validation
             else:
                 print("[VideoProcessor] Cloud returned no states, falling back to local...")
                 
@@ -72,6 +75,8 @@ def process_video(
             print(f"[VideoProcessor] Cloud unavailable (missing package): {e}")
         except Exception as e:
             print(f"[VideoProcessor] Cloud extraction failed: {e}")
+            import traceback
+            traceback.print_exc()
             print("[VideoProcessor] Falling back to local processing...")
     
     # Try local parallel processing

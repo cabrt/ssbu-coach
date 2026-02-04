@@ -106,8 +106,9 @@ def find_patterns(game_states: list) -> dict:
         # damage dealt to p2 (opponent)
         p2_damage_taken = max(0, p2_percent - prev_p2_percent)
         
-        # detect damage spikes (you took significant damage)
-        # more lenient threshold (20%) to catch more events, with persistence check
+        # detect damage spikes (you took significant damage QUICKLY)
+        # "Quick" = 20%+ damage in a short time window without dealing damage back
+        # Check recent history to see if this is truly rapid damage
         if (p1_damage_taken >= 20 and p1_damage_taken <= 80 and
             p1_percent > prev_p1_percent and
             p1_percent <= 180 and prev_p1_percent <= 180):
@@ -115,7 +116,9 @@ def find_patterns(game_states: list) -> dict:
             if not (prev_p1_percent == 0 and p1_percent > 60):
                 # PERSISTENCE CHECK: new percent must hold for at least 1 more frame
                 spike_confirmed = verify_damage_spike(smoothed_states, i, "p1", p1_percent)
-                if spike_confirmed:
+                # QUICK CHECK: verify this is actually rapid damage, not gradual
+                is_quick = verify_quick_damage(smoothed_states, i, "p1", prev_p1_percent, p1_percent)
+                if spike_confirmed and is_quick:
                     patterns["damage_spikes"].append({
                         "timestamp": timestamp,
                         "damage": p1_damage_taken,
@@ -138,33 +141,91 @@ def find_patterns(game_states: list) -> dict:
                         "to_percent": p2_percent
                     })
         
-        # detect combos (you dealt good damage)
-        # cap single-delta to 60% to avoid OCR noise accumulation
+        # detect combos (you dealt good damage in rapid succession)
+        # A TRUE COMBO requires:
+        # 1. 3+ hits (damage instances) in rapid succession
+        # 2. No getting hit back in between (p1 damage stays same)
+        # 3. Hits within ~5 seconds total
         capped_p2_damage = min(p2_damage_taken, 60) if p2_damage_taken > 0 else 0
-        if capped_p2_damage > 10:
-            if combo_start is None:
-                combo_start = timestamp
-                combo_from_percent = prev_p2_percent
-                combo_damage = capped_p2_damage
-                combo_hits = 1
+        you_got_hit = p1_damage_taken > 5  # You took damage this frame
+        
+        if capped_p2_damage > 8:  # You dealt damage
+            if you_got_hit:
+                # You got hit while dealing damage - not a true combo, reset
+                if combo_start and combo_hits >= 3 and combo_damage > 25:
+                    patterns["combos"].append({
+                        "start": combo_start,
+                        "end": prev_timestamp if 'prev_timestamp' in dir() else timestamp,
+                        "damage": min(combo_damage, 100),
+                        "from_percent": combo_from_percent,
+                        "to_percent": min(combo_from_percent + combo_damage, 200),
+                        "hits": combo_hits
+                    })
+                combo_start = None
+                combo_damage = 0
+                combo_hits = 0
+                combo_from_percent = 0
             else:
-                combo_damage += capped_p2_damage
-                combo_hits += 1
-        else:
-            # require combo damage > 20 to count
-            if combo_start and combo_damage > 20:
-                # cap reported combo damage at realistic values
+                # Continue or start combo
+                if combo_start is None:
+                    combo_start = timestamp
+                    combo_from_percent = prev_p2_percent
+                    combo_damage = capped_p2_damage
+                    combo_hits = 1
+                else:
+                    # Check if too much time passed (>5 seconds = not a combo)
+                    if timestamp - combo_start > 5:
+                        # Save old combo if valid, start new one
+                        if combo_hits >= 3 and combo_damage > 25:
+                            patterns["combos"].append({
+                                "start": combo_start,
+                                "end": prev_timestamp if 'prev_timestamp' in dir() else timestamp,
+                                "damage": min(combo_damage, 100),
+                                "from_percent": combo_from_percent,
+                                "to_percent": min(combo_from_percent + combo_damage, 200),
+                                "hits": combo_hits
+                            })
+                        combo_start = timestamp
+                        combo_from_percent = prev_p2_percent
+                        combo_damage = capped_p2_damage
+                        combo_hits = 1
+                    else:
+                        combo_damage += capped_p2_damage
+                        combo_hits += 1
+        elif you_got_hit:
+            # You got hit without dealing damage - combo broken
+            if combo_start and combo_hits >= 3 and combo_damage > 25:
                 patterns["combos"].append({
                     "start": combo_start,
-                    "end": timestamp,
-                    "damage": min(combo_damage, 100),  # cap at 100%
+                    "end": prev_timestamp if 'prev_timestamp' in dir() else timestamp,
+                    "damage": min(combo_damage, 100),
                     "from_percent": combo_from_percent,
-                    "to_percent": min(combo_from_percent + combo_damage, 200)
+                    "to_percent": min(combo_from_percent + combo_damage, 200),
+                    "hits": combo_hits
                 })
             combo_start = None
             combo_damage = 0
             combo_hits = 0
             combo_from_percent = 0
+        else:
+            # No damage either way - check if combo timed out
+            if combo_start and timestamp - combo_start > 3:
+                # Combo ended due to inactivity
+                if combo_hits >= 3 and combo_damage > 25:
+                    patterns["combos"].append({
+                        "start": combo_start,
+                        "end": prev_timestamp if 'prev_timestamp' in dir() else timestamp,
+                        "damage": min(combo_damage, 100),
+                        "from_percent": combo_from_percent,
+                        "to_percent": min(combo_from_percent + combo_damage, 200),
+                        "hits": combo_hits
+                    })
+                combo_start = None
+                combo_damage = 0
+                combo_hits = 0
+                combo_from_percent = 0
+        
+        prev_timestamp = timestamp
         
         # detect your stock losses - try stock count first, then percent-reset fallback
         stock_loss_detected = detect_stock_loss(
@@ -350,6 +411,64 @@ def detect_death_by_percent_reset(game_states: list, current_idx: int, player: s
         return None
     
     return {"death_percent": max_recent_percent}
+
+
+def verify_quick_damage(game_states: list, current_idx: int, player: str, 
+                        from_percent: float, to_percent: float) -> bool:
+    """
+    Verify that damage was taken QUICKLY - within a short time window.
+    
+    "Quick damage" means:
+    1. The damage happened within ~5 seconds
+    2. You didn't deal significant damage back during that window
+    
+    This prevents flagging gradual damage exchanges as "quick damage".
+    """
+    if current_idx < 1:
+        return True  # Can't verify, assume quick
+    
+    damage_taken = to_percent - from_percent
+    if damage_taken < 20:
+        return False  # Not significant enough
+    
+    # Look back to find when damage started accumulating
+    percent_key = f"{player}_percent"
+    opponent_key = "p2_percent" if player == "p1" else "p1_percent"
+    
+    # Find the frame where percent was at from_percent
+    start_idx = current_idx
+    for j in range(1, min(15, current_idx)):  # Look back up to 15 frames (~15 seconds at 1fps)
+        prev_state = game_states[current_idx - j]
+        prev_pct = prev_state.get(percent_key)
+        if prev_pct is not None and prev_pct <= from_percent + 5:
+            start_idx = current_idx - j
+            break
+    
+    # Calculate time window
+    start_time = game_states[start_idx]["timestamp"]
+    end_time = game_states[current_idx]["timestamp"]
+    time_window = end_time - start_time
+    
+    # If damage took more than 5 seconds, it's not "quick"
+    if time_window > 5:
+        return False
+    
+    # Check if you dealt significant damage back during this window
+    # If you did, this is an exchange, not getting comboed
+    damage_dealt_back = 0
+    for j in range(start_idx, current_idx + 1):
+        if j > 0:
+            curr_opp = game_states[j].get(opponent_key) or 0
+            prev_opp = game_states[j - 1].get(opponent_key) or 0
+            delta = max(0, curr_opp - prev_opp)
+            if delta < 60:  # Cap to avoid OCR errors
+                damage_dealt_back += delta
+    
+    # If you dealt back more than 30% of what you took, it's an exchange, not one-sided
+    if damage_dealt_back > damage_taken * 0.3:
+        return False
+    
+    return True
 
 
 def verify_damage_spike(game_states: list, current_idx: int, player: str, expected_percent: int) -> bool:
