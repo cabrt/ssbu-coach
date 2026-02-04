@@ -300,9 +300,25 @@ def find_patterns(game_states: list) -> dict:
         if confirmed_p1_stocks == 0 or confirmed_p2_stocks == 0:
             patterns["game_end"] = timestamp
         
-        # detect final KO: when opponent percent goes to None while at high percent
+        # detect YOUR final death: when your percent goes to None while at high percent
+        # This catches the game-ending death even if stock detection fails
+        if (prev_p1_percent is not None and prev_p1_percent >= 60 and 
+            state.get("p1_percent") is None):
+            # Check if this is near the end of the video (within last 20% of frames)
+            if i >= len(smoothed_states) * 0.8:
+                # This is likely the final death
+                if not patterns.get("stock_losses") or all(l["timestamp"] < timestamp - 5 for l in patterns["stock_losses"]):
+                    patterns["stock_losses"].append({
+                        "timestamp": timestamp,
+                        "percent": prev_p1_percent,
+                        "stocks_remaining": 0,  # final death
+                        "is_game_ender": True
+                    })
+                    patterns["game_end"] = timestamp
+        
+        # detect OPPONENT final KO: when opponent percent goes to None while at high percent
         # This catches the game-ending kill even if stock detection fails
-        if (prev_p2_percent is not None and prev_p2_percent >= 80 and 
+        if (prev_p2_percent is not None and prev_p2_percent >= 60 and 
             state.get("p2_percent") is None):
             # Check if this is near the end of the video (within last 20% of frames)
             if i >= len(smoothed_states) * 0.8:

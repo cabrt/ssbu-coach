@@ -156,27 +156,30 @@ def _process_batch(frames: List[tuple], batch_idx: int) -> List[dict]:
 YOUR TASK: Extract the EXACT damage percentages and stock counts shown on screen.
 
 WHAT TO LOOK FOR:
-- Damage percentages are large colored numbers (red/orange/yellow) near the bottom of the screen
-- Player 1 (P1) is on the LEFT side, Player 2 (P2) is on the RIGHT side
-- The numbers show damage like "42%" or "127%"
-- Stock icons are small character head portraits (count them: 0, 1, 2, or 3)
-- "GO!" or "READY" text = game starting, set game_active to false
-- "GAME!" text = game ENDED, but STILL read the stock counts! This is CRITICAL for determining the winner.
+- Damage percentages are large colored numbers (red/orange/yellow) at the BOTTOM of the screen
+- Player 1 (P1) HUD is on the LEFT side, Player 2 (P2) HUD is on the RIGHT side
+- Stock icons are small character portrait icons below/near the damage percent
+- Count the stock icons carefully: 0, 1, 2, or 3
 
-IMPORTANT FOR "GAME!" SCREENS:
-- When you see "GAME!" text, the match just ended
-- The WINNER is the player who still has 1+ stocks
-- The LOSER is the player with 0 stocks
-- You MUST still extract stock counts on GAME! screens - this determines who won!
-- Set game_active to false but STILL provide p1_stocks and p2_stocks values
+DETECTING "GAME!" END SCREENS:
+- "GAME!" appears in large text when the match ENDS
+- On GAME! screens, one player ALWAYS has 0 stocks (they lost)
+- The other player has 1, 2, or 3 stocks (they won)
+- Look carefully at where stock icons SHOULD be - if a player's stock area is EMPTY, they have 0 stocks
+- The losing player's stock icons will be GONE or show 0
 
-CRITICAL RULES:
-1. READ the EXACT numbers shown - do NOT guess or estimate
-2. If a number is partially obscured or unclear, use null
-3. Percentages are whole numbers or have one decimal (e.g., 42, 85.5, 127)
-4. Stock counts are 0, 1, 2, or 3 (0 is valid and important!)
+CRITICAL - STOCK READING:
+- Stock icons are small character face portraits
+- If you see NO portraits in a player's stock area = 0 stocks
+- If portraits are greyed out or have an X = those stocks are lost
+- One player MUST have 0 stocks when "GAME!" appears
 
-Return ONLY a JSON array like this:
+RULES:
+1. READ exact numbers shown - do NOT guess
+2. Stock counts: 0, 1, 2, or 3 (0 is VALID and CRITICAL for game end)
+3. game_active = false when you see "GAME!", "GO!", or "READY" text
+
+Return ONLY a JSON array:
 [
   {"timestamp": 0.0, "p1_percent": 0, "p2_percent": 0, "p1_stocks": 3, "p2_stocks": 3, "game_active": true},
   {"timestamp": 210.0, "p1_percent": null, "p2_percent": null, "p1_stocks": 0, "p2_stocks": 1, "game_active": false}

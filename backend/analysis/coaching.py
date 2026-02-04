@@ -297,6 +297,29 @@ def calculate_stats(game_states: list) -> dict:
             winner = "p1"
             print(f"[Winner] P1 lost {p1_stock_losses} stocks, P2 lost {p2_stock_losses} -> P1 wins")
     
+    # Method 4: If game ended (game_active=false) and stocks still tied, 
+    # use last known percent - higher percent player likely got KO'd
+    if winner == "unknown":
+        # Find the last frame before game_active became false
+        last_active_frame = None
+        for s in reversed(game_states):
+            if s.get("game_active", True):
+                last_active_frame = s
+                break
+        
+        if last_active_frame:
+            p1_last_pct = last_active_frame.get("p1_percent")
+            p2_last_pct = last_active_frame.get("p2_percent")
+            
+            # The player at HIGHER percent just before "GAME!" was likely KO'd
+            if p1_last_pct is not None and p2_last_pct is not None:
+                if p1_last_pct > p2_last_pct + 20:
+                    winner = "p2"  # P1 at higher percent = P1 got KO'd = P2 wins
+                    print(f"[Winner] Last active: P1={p1_last_pct}%, P2={p2_last_pct}% -> P1 likely KO'd -> P2 wins")
+                elif p2_last_pct > p1_last_pct + 20:
+                    winner = "p1"  # P2 at higher percent = P2 got KO'd = P1 wins
+                    print(f"[Winner] Last active: P1={p1_last_pct}%, P2={p2_last_pct}% -> P2 likely KO'd -> P1 wins")
+    
     # Get final stock counts
     def get_mode(lst):
         if not lst:
