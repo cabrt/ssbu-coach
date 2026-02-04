@@ -31,7 +31,7 @@ def extract_frames_cloud_v2(
     progress_callback: Callable[[float], None] = None,
     max_duration: int = None,
     batch_size: int = 8,  # Smaller batches for better accuracy
-    max_parallel_batches: int = 2,
+    max_parallel_batches: int = 1,  # Sequential to avoid rate limits
 ) -> List[dict]:
     """
     Extract game states using Gemini vision.
@@ -146,8 +146,11 @@ def _extract_frames(video_path: str, fps_sample: float, max_duration: Optional[i
     return frames
 
 
-def _process_batch(frames: List[tuple], batch_idx: int) -> List[dict]:
-    """Process a batch of frames with Gemini."""
+def _process_batch(frames: List[tuple], batch_idx: int, max_retries: int = 3) -> List[dict]:
+    """Process a batch of frames with Gemini, with retry logic for rate limits."""
+    import time as time_module
+    import random
+    
     model = genai.GenerativeModel('gemini-2.0-flash')
     
     prompt_parts = [
@@ -198,48 +201,60 @@ Here are the frames to analyze:
     
     prompt_parts.append("\n\nReturn ONLY the JSON array with extracted values:")
     
-    try:
-        response = model.generate_content(
-            prompt_parts,
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.0,
-                max_output_tokens=2000,
+    # Retry loop with exponential backoff
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content(
+                prompt_parts,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.0,
+                    max_output_tokens=2000,
+                )
             )
-        )
-        
-        text = response.text.strip()
-        
-        # Extract JSON
-        if "```json" in text:
-            text = text.split("```json")[1].split("```")[0].strip()
-        elif "```" in text:
-            text = text.split("```")[1].split("```")[0].strip()
-        
-        data = json.loads(text)
-        
-        # Clean up
-        states = []
-        for item in data:
-            states.append({
-                "timestamp": round(float(item.get("timestamp", 0)), 1),
-                "p1_percent": _parse_percent(item.get("p1_percent")),
-                "p2_percent": _parse_percent(item.get("p2_percent")),
-                "p1_stocks": _parse_stocks(item.get("p1_stocks")),
-                "p2_stocks": _parse_stocks(item.get("p2_stocks")),
-                "game_active": item.get("game_active", True),
-                "p1_character": None,
-                "p2_character": None,
-            })
-        
-        return states
-        
-    except json.JSONDecodeError as e:
-        print(f"[CloudExtractor v2] JSON error in batch {batch_idx}: {e}")
-        print(f"[CloudExtractor v2] Response: {text[:500] if 'text' in dir() else 'N/A'}")
-        return []
-    except Exception as e:
-        print(f"[CloudExtractor v2] Error in batch {batch_idx}: {e}")
-        return []
+            
+            text = response.text.strip()
+            
+            # Extract JSON
+            if "```json" in text:
+                text = text.split("```json")[1].split("```")[0].strip()
+            elif "```" in text:
+                text = text.split("```")[1].split("```")[0].strip()
+            
+            data = json.loads(text)
+            
+            # Clean up
+            states = []
+            for item in data:
+                states.append({
+                    "timestamp": round(float(item.get("timestamp", 0)), 1),
+                    "p1_percent": _parse_percent(item.get("p1_percent")),
+                    "p2_percent": _parse_percent(item.get("p2_percent")),
+                    "p1_stocks": _parse_stocks(item.get("p1_stocks")),
+                    "p2_stocks": _parse_stocks(item.get("p2_stocks")),
+                    "game_active": item.get("game_active", True),
+                    "p1_character": None,
+                    "p2_character": None,
+                })
+            
+            return states
+            
+        except json.JSONDecodeError as e:
+            print(f"[CloudExtractor v2] JSON error in batch {batch_idx}: {e}")
+            return []
+        except Exception as e:
+            error_str = str(e)
+            # Check if it's a rate limit error (429)
+            if "429" in error_str or "Resource exhausted" in error_str:
+                if attempt < max_retries - 1:
+                    # Exponential backoff: 5s, 15s, 45s + random jitter
+                    wait_time = (5 * (3 ** attempt)) + random.uniform(0, 5)
+                    print(f"[CloudExtractor v2] Rate limited on batch {batch_idx}, waiting {wait_time:.1f}s (attempt {attempt + 1}/{max_retries})")
+                    time_module.sleep(wait_time)
+                    continue
+            print(f"[CloudExtractor v2] Error in batch {batch_idx}: {e}")
+            return []
+    
+    return []  # All retries failed
 
 
 def _parse_percent(value) -> Optional[float]:
