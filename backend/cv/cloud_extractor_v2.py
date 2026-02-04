@@ -10,7 +10,7 @@ import json
 import os
 import sys
 from pathlib import Path
-# ThreadPoolExecutor removed - using sequential processing to avoid rate limits
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import List, Optional, Callable
 import time
@@ -30,8 +30,8 @@ def extract_frames_cloud_v2(
     fps_sample: float = 2.0,  # 2 fps for better accuracy on peak percentages
     progress_callback: Callable[[float], None] = None,
     max_duration: int = None,
-    batch_size: int = 8,  # Smaller batches for better accuracy
-    max_parallel_batches: int = 1,  # Sequential to avoid rate limits
+    batch_size: int = 8,  # Frames per API call
+    max_parallel_batches: int = 2,  # 2 parallel to avoid rate limits while staying fast
 ) -> List[dict]:
     """
     Extract game states using Gemini vision.
@@ -60,31 +60,28 @@ def extract_frames_cloud_v2(
     if not frames:
         return []
     
-    import time as time_module
-    
     # Create batches
     batches = [frames[i:i+batch_size] for i in range(0, len(frames), batch_size)]
-    print(f"[CloudExtractor v2] Processing {len(batches)} batches SEQUENTIALLY with 4s delay")
+    print(f"[CloudExtractor v2] Processing {len(batches)} batches (parallel workers={max_parallel_batches})")
     
-    # Process batches SEQUENTIALLY with delay to avoid rate limits
+    # Process batches in parallel (batching + cloud OCR)
     all_states = []
     
-    for batch_idx, batch in enumerate(batches):
-        try:
-            states = _process_batch(batch, batch_idx)
-            all_states.extend(states)
-            
-            if progress_callback:
-                progress_callback((batch_idx + 1) / len(batches) * 0.9)
-            
-            print(f"[CloudExtractor v2] Batch {batch_idx + 1}/{len(batches)}: {len(states)} states")
-            
-            # Wait between batches (paid tier has much higher limits)
-            if batch_idx < len(batches) - 1:
-                time_module.sleep(1)  # 1 second between batches
+    with ThreadPoolExecutor(max_workers=max_parallel_batches) as executor:
+        futures = {executor.submit(_process_batch, batch, idx): idx for idx, batch in enumerate(batches)}
+        
+        for future in as_completed(futures):
+            batch_idx = futures[future]
+            try:
+                states = future.result()
+                all_states.extend(states)
                 
-        except Exception as e:
-            print(f"[CloudExtractor v2] Batch {batch_idx} error: {e}")
+                if progress_callback:
+                    progress_callback((batch_idx + 1) / len(batches) * 0.9)
+                
+                print(f"[CloudExtractor v2] Batch {batch_idx + 1}/{len(batches)}: {len(states)} states")
+            except Exception as e:
+                print(f"[CloudExtractor v2] Batch {batch_idx} error: {e}")
     
     # Sort by timestamp
     all_states.sort(key=lambda s: s["timestamp"])
@@ -246,8 +243,8 @@ Here are the frames to analyze:
             # Check if it's a rate limit error (429)
             if "429" in error_str or "Resource exhausted" in error_str:
                 if attempt < max_retries - 1:
-                    # Exponential backoff: 5s, 15s, 45s + random jitter
-                    wait_time = (5 * (3 ** attempt)) + random.uniform(0, 5)
+                    # Exponential backoff: 2s, 4s, 8s + small jitter (faster for paid tier)
+                    wait_time = (2 * (2 ** attempt)) + random.uniform(0, 1)
                     print(f"[CloudExtractor v2] Rate limited on batch {batch_idx}, waiting {wait_time:.1f}s (attempt {attempt + 1}/{max_retries})")
                     time_module.sleep(wait_time)
                     continue
