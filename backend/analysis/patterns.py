@@ -252,6 +252,11 @@ def find_patterns(game_states: list) -> dict:
         
         prev_timestamp = timestamp
         
+        # GAME OVER CHECK: Once either player reaches 0 stocks, no more stock events
+        if confirmed_p1_stocks == 0 or confirmed_p2_stocks == 0:
+            # Game is over - skip all stock detection
+            continue
+        
         # detect your stock losses - try stock count first, then percent-reset fallback
         stock_loss_detected = detect_stock_loss(
             smoothed_states, i, "p1", confirmed_p1_stocks, 
@@ -276,6 +281,9 @@ def find_patterns(game_states: list) -> dict:
             confirmed_p1_stocks = stock_loss_detected["new_stocks"]
             p1_max_recent_percent = 0
             prev_p1_percent = 0
+            # Check if game just ended
+            if confirmed_p1_stocks == 0:
+                continue
         elif percent_reset_death:
             # Use fallback detection with raw max lookback
             confirmed_p1_stocks = max(0, confirmed_p1_stocks - 1)
@@ -289,6 +297,9 @@ def find_patterns(game_states: list) -> dict:
             })
             p1_max_recent_percent = 0
             prev_p1_percent = 0
+            # Check if game just ended
+            if confirmed_p1_stocks == 0:
+                continue
         
         # detect opponent stock losses (your kills) 
         opp_stock_loss = detect_stock_loss(
@@ -330,38 +341,49 @@ def find_patterns(game_states: list) -> dict:
         # detect game end (someone has 0 stocks)
         if confirmed_p1_stocks == 0 or confirmed_p2_stocks == 0:
             patterns["game_end"] = timestamp
+            # Once game is over, no more stock events should be detected
+            # The earlier continue statements handle this for new iterations
         
-        # detect YOUR final death: when your percent goes to None while at high percent
-        # This catches the game-ending death even if stock detection fails
-        if (prev_p1_percent is not None and prev_p1_percent >= 60 and 
-            state.get("p1_percent") is None):
-            # Check if this is near the end of the video (within last 20% of frames)
-            if i >= len(smoothed_states) * 0.8:
-                # This is likely the final death
-                if not patterns.get("stock_losses") or all(l["timestamp"] < timestamp - 5 for l in patterns["stock_losses"]):
-                    patterns["stock_losses"].append({
-                        "timestamp": timestamp,
-                        "percent": prev_p1_percent,
-                        "stocks_remaining": 0,  # final death
-                        "is_game_ender": True
-                    })
-                    patterns["game_end"] = timestamp
-        
-        # detect OPPONENT final KO: when opponent percent goes to None while at high percent
-        # This catches the game-ending kill even if stock detection fails
-        if (prev_p2_percent is not None and prev_p2_percent >= 60 and 
-            state.get("p2_percent") is None):
-            # Check if this is near the end of the video (within last 20% of frames)
-            if i >= len(smoothed_states) * 0.8:
-                # This is likely the final KO
-                if not patterns.get("kills") or all(k["timestamp"] < timestamp - 5 for k in patterns["kills"]):
-                    patterns["kills"].append({
-                        "timestamp": timestamp,
-                        "opponent_percent": prev_p2_percent,
-                        "opponent_stocks_remaining": 0,  # final KO
-                        "is_game_winner": True
-                    })
-                    patterns["game_end"] = timestamp
+        # SKIP fallback detection if game is already over
+        # (game ends when either player reaches 0 stocks)
+        if confirmed_p1_stocks == 0 or confirmed_p2_stocks == 0:
+            pass  # Skip fallback detection - game already ended
+        else:
+            # detect YOUR final death: when your percent goes to None while at high percent
+            # This catches the game-ending death even if stock detection fails
+            if (prev_p1_percent is not None and prev_p1_percent >= 60 and 
+                state.get("p1_percent") is None):
+                # Check if this is near the end of the video (within last 20% of frames)
+                if i >= len(smoothed_states) * 0.8:
+                    # This is likely the final death
+                    if not patterns.get("stock_losses") or all(l["timestamp"] < timestamp - 5 for l in patterns["stock_losses"]):
+                        patterns["stock_losses"].append({
+                            "timestamp": timestamp,
+                            "percent": prev_p1_percent,
+                            "stocks_remaining": 0,  # final death
+                            "is_game_ender": True
+                        })
+                        patterns["game_end"] = timestamp
+                        confirmed_p1_stocks = 0  # Mark game as over
+            
+            # detect OPPONENT final KO: when opponent percent goes to None while at high percent
+            # This catches the game-ending kill even if stock detection fails  
+            # BUT only if P1 didn't just die (game can't have both at 0)
+            if confirmed_p1_stocks > 0:
+                if (prev_p2_percent is not None and prev_p2_percent >= 60 and 
+                    state.get("p2_percent") is None):
+                    # Check if this is near the end of the video (within last 20% of frames)
+                    if i >= len(smoothed_states) * 0.8:
+                        # This is likely the final KO
+                        if not patterns.get("kills") or all(k["timestamp"] < timestamp - 5 for k in patterns["kills"]):
+                            patterns["kills"].append({
+                                "timestamp": timestamp,
+                                "opponent_percent": prev_p2_percent,
+                                "opponent_stocks_remaining": 0,  # final KO
+                                "is_game_winner": True
+                            })
+                            patterns["game_end"] = timestamp
+                            confirmed_p2_stocks = 0  # Mark game as over
         
         # detect long neutral (no significant damage for a while)
         total_damage = p1_damage_taken + p2_damage_taken
