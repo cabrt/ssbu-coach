@@ -160,18 +160,26 @@ WHAT TO LOOK FOR:
 - Player 1 (P1) is on the LEFT side, Player 2 (P2) is on the RIGHT side
 - The numbers show damage like "42%" or "127%"
 - Stock icons are small character head portraits (count them: 0, 1, 2, or 3)
-- If you see "GO!" or "GAME!" or "READY" text, the game hasn't started yet - set game_active to false
+- "GO!" or "READY" text = game starting, set game_active to false
+- "GAME!" text = game ENDED, but STILL read the stock counts! This is CRITICAL for determining the winner.
+
+IMPORTANT FOR "GAME!" SCREENS:
+- When you see "GAME!" text, the match just ended
+- The WINNER is the player who still has 1+ stocks
+- The LOSER is the player with 0 stocks
+- You MUST still extract stock counts on GAME! screens - this determines who won!
+- Set game_active to false but STILL provide p1_stocks and p2_stocks values
 
 CRITICAL RULES:
 1. READ the EXACT numbers shown - do NOT guess or estimate
 2. If a number is partially obscured or unclear, use null
 3. Percentages are whole numbers or have one decimal (e.g., 42, 85.5, 127)
-4. Stock counts are 0, 1, 2, or 3
+4. Stock counts are 0, 1, 2, or 3 (0 is valid and important!)
 
 Return ONLY a JSON array like this:
 [
   {"timestamp": 0.0, "p1_percent": 0, "p2_percent": 0, "p1_stocks": 3, "p2_stocks": 3, "game_active": true},
-  {"timestamp": 1.0, "p1_percent": 15, "p2_percent": 8, "p1_stocks": 3, "p2_stocks": 3, "game_active": true}
+  {"timestamp": 210.0, "p1_percent": null, "p2_percent": null, "p1_stocks": 0, "p2_stocks": 1, "game_active": false}
 ]
 
 Here are the frames to analyze:
@@ -261,7 +269,7 @@ def _validate_states(states: List[dict]) -> List[dict]:
     if not states:
         return []
     
-    # Find game start (skip pre-game frames)
+    # Find game start (skip pre-game frames like "READY" or "GO!")
     start_idx = 0
     for i, s in enumerate(states):
         # Game starts when we have actual percent data and game is active
@@ -276,10 +284,20 @@ def _validate_states(states: List[dict]) -> List[dict]:
     last_p2_stocks = 3
     max_p1 = 0
     max_p2 = 0
+    game_ended = False
     
     for state in states[start_idx:]:
+        # Skip pre-game frames, but KEEP end-game frames (game_active=false after game started)
         if not state.get("game_active", True):
-            continue
+            if game_ended:
+                # Already processed end-game, skip further frames
+                continue
+            elif last_p1_stocks > 0 or last_p2_stocks > 0:
+                # This is an end-game frame (GAME! screen) - process it for stock counts
+                game_ended = True
+                # Fall through to process this frame
+            else:
+                continue
         
         p1 = state.get("p1_percent")
         p2 = state.get("p2_percent")
