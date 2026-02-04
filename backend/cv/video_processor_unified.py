@@ -52,11 +52,12 @@ def process_video(
     # Try cloud extraction first (v2 with improved accuracy)
     if prefer_cloud and has_cloud_key and not force_local:
         try:
-            print("[VideoProcessor] Attempting cloud extraction v2 (Gemini 1.5 Flash)...")
+            print("[VideoProcessor] Attempting cloud extraction v2 (Gemini 2.0 Flash)...")
             from cv.cloud_extractor_v2 import extract_frames_cloud_v2
             
-            # Use 1.0 fps for better accuracy (was 0.5)
-            actual_fps = max(fps_sample, 1.0)
+            # Use 2.0 fps for better accuracy capturing peak percentages
+            actual_fps = max(fps_sample, 2.0)
+            print(f"[VideoProcessor] Using fps_sample={actual_fps}")
             
             states = extract_frames_cloud_v2(
                 video_path=video_path,
