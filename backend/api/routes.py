@@ -11,7 +11,7 @@ backend_dir = str(Path(__file__).resolve().parent.parent)
 if backend_dir not in sys.path:
     sys.path.insert(0, backend_dir)
 
-from cv.video_processor import process_video
+from cv.video_processor_unified import process_video
 from analysis.coaching import generate_coaching
 from analysis.characters import ALL_CHARACTERS
 
