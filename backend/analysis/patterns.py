@@ -79,6 +79,10 @@ def find_patterns(game_states: list) -> dict:
     p1_max_recent_percent = 0
     p2_max_recent_percent = 0
     
+    # track GLOBAL max percents (not reset on death) for accurate stats
+    global_p1_max = 0
+    global_p2_max = 0
+    
     for i, state in enumerate(smoothed_states):
         # skip states before game started
         if state["timestamp"] < game_start_time:
@@ -100,6 +104,10 @@ def find_patterns(game_states: list) -> dict:
         # track maximum percent reached (for validating stock losses)
         p1_max_recent_percent = max(p1_max_recent_percent, p1_percent)
         p2_max_recent_percent = max(p2_max_recent_percent, p2_percent)
+        
+        # track GLOBAL max (never resets, for accurate stats)
+        global_p1_max = max(global_p1_max, p1_percent)
+        global_p2_max = max(global_p2_max, p2_percent)
         
         # damage taken by p1 (you)
         p1_damage_taken = max(0, p1_percent - prev_p1_percent)
@@ -326,7 +334,37 @@ def find_patterns(game_states: list) -> dict:
         prev_p1_percent = p1_percent
         prev_p2_percent = p2_percent
     
+    # Deduplicate stock events - only keep one per actual stock loss
+    # Stock events within 5 seconds of each other are the same event
+    patterns["stock_losses"] = _deduplicate_events(patterns["stock_losses"], time_window=5.0)
+    patterns["kills"] = _deduplicate_events(patterns["kills"], time_window=5.0)
+    
+    # Track global max percents (not affected by resets after deaths)
+    patterns["p1_true_max_percent"] = global_p1_max
+    patterns["p2_true_max_percent"] = global_p2_max
+    
     return patterns
+
+
+def _deduplicate_events(events: list, time_window: float = 5.0) -> list:
+    """Remove duplicate events within a time window, keeping the first one."""
+    if not events:
+        return events
+    
+    # Sort by timestamp
+    sorted_events = sorted(events, key=lambda x: x.get("timestamp", 0))
+    
+    deduplicated = []
+    last_timestamp = -999
+    
+    for event in sorted_events:
+        ts = event.get("timestamp", 0)
+        # If this event is more than time_window after the last one, keep it
+        if ts - last_timestamp > time_window:
+            deduplicated.append(event)
+            last_timestamp = ts
+    
+    return deduplicated
 
 
 def smooth_game_states(game_states: list) -> list:

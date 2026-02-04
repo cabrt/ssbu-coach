@@ -3,10 +3,11 @@ export default function Timeline({ tips, duration, onSeek }) {
 
   const getMarkerColor = (type) => {
     switch (type) {
-      case 'damage_taken': return '#ef4444'
-      case 'stock_lost': return '#dc2626'
-      case 'combo': return '#22c55e'
-      case 'neutral': return '#eab308'
+      case 'damage_taken': return '#ef4444'  // Red
+      case 'stock_lost': return '#dc2626'    // Dark red
+      case 'stock_taken': return '#3b82f6'   // Blue (you took their stock)
+      case 'combo': return '#22c55e'         // Green
+      case 'neutral': return '#eab308'       // Yellow
       default: return '#888'
     }
   }
@@ -38,6 +39,14 @@ export default function Timeline({ tips, duration, onSeek }) {
         <span className="legend-item">
           <span className="legend-dot" style={{ background: '#ef4444' }} />
           Damage taken
+        </span>
+        <span className="legend-item">
+          <span className="legend-dot" style={{ background: '#dc2626' }} />
+          Stock lost
+        </span>
+        <span className="legend-item">
+          <span className="legend-dot" style={{ background: '#3b82f6' }} />
+          Stock taken
         </span>
         <span className="legend-item">
           <span className="legend-dot" style={{ background: '#22c55e' }} />

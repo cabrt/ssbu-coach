@@ -169,9 +169,9 @@ def generate_coaching(game_states: list, player_char: str = None, opponent_char:
     summary, enhanced_tips = generate_ai_coaching(raw_stats, patterns, tips, player_char, opponent_char)
     
     # Normalize stats for frontend: always "your" and "opponent" (no p1/p2)
-    # Format max percents with one decimal
-    your_max = raw_stats.get("p1_max_percent", 0)
-    opp_max = raw_stats.get("p2_max_percent", 0)
+    # Use true max from patterns (tracks global max, not reset on death)
+    your_max = patterns.get("p1_true_max_percent") or raw_stats.get("p1_max_percent", 0)
+    opp_max = patterns.get("p2_true_max_percent") or raw_stats.get("p2_max_percent", 0)
     
     stats = {
         "duration": raw_stats.get("duration", 0),
@@ -229,82 +229,76 @@ def calculate_stats(game_states: list) -> dict:
         "p2_avg_percent": sum(p2_percents) / len(p2_percents) if p2_percents else 0,
     }
     
-    # determine winner using multiple signals (stocks are often unreliable)
-    last_frames = game_states[-15:] if len(game_states) >= 15 else game_states
+    # Determine winner - look BEFORE the end (when GAME! screen might corrupt data)
+    # Use frames from ~10-20 seconds before end to find last valid stock counts
+    winner = "unknown"
     
-    p1_final_stocks_list = [s.get("p1_stocks") for s in last_frames if s.get("p1_stocks") is not None]
-    p2_final_stocks_list = [s.get("p2_stocks") for s in last_frames if s.get("p2_stocks") is not None]
+    # Find the last frame before stocks become invalid (both 0 or None)
+    valid_stock_frames = []
+    for s in game_states:
+        p1_stocks = s.get("p1_stocks")
+        p2_stocks = s.get("p2_stocks")
+        # Valid if at least one player has stocks > 0
+        if (p1_stocks is not None and p1_stocks > 0) or (p2_stocks is not None and p2_stocks > 0):
+            valid_stock_frames.append(s)
     
+    if valid_stock_frames:
+        # Look at the last few valid frames
+        last_valid = valid_stock_frames[-10:] if len(valid_stock_frames) >= 10 else valid_stock_frames
+        
+        # Find the lowest stock count for each player in the valid frames
+        p1_stocks_list = [s.get("p1_stocks") for s in last_valid if s.get("p1_stocks") is not None]
+        p2_stocks_list = [s.get("p2_stocks") for s in last_valid if s.get("p2_stocks") is not None]
+        
+        # The player who reached lower stocks (or 0 first) lost
+        p1_min = min(p1_stocks_list) if p1_stocks_list else 3
+        p2_min = min(p2_stocks_list) if p2_stocks_list else 3
+        
+        if p1_min < p2_min:
+            winner = "p2"  # P1 lost more stocks = P2 wins
+        elif p2_min < p1_min:
+            winner = "p1"  # P2 lost more stocks = P1 wins
+        else:
+            # Stocks tied - check who had higher percent at the end (they likely died)
+            last_percents = last_valid[-5:] if len(last_valid) >= 5 else last_valid
+            p1_final_pcts = [s.get("p1_percent") for s in last_percents if s.get("p1_percent") is not None]
+            p2_final_pcts = [s.get("p2_percent") for s in last_percents if s.get("p2_percent") is not None]
+            
+            if p1_final_pcts and p2_final_pcts:
+                p1_avg = sum(p1_final_pcts) / len(p1_final_pcts)
+                p2_avg = sum(p2_final_pcts) / len(p2_final_pcts)
+                
+                # Higher percent at end = likely got KO'd = lost
+                if p1_avg > p2_avg + 30:
+                    winner = "p2"  # P1 at higher percent = P1 likely died = P2 wins
+                elif p2_avg > p1_avg + 30:
+                    winner = "p1"  # P2 at higher percent = P2 likely died = P1 wins
+    
+    # Fallback: check if one player's data disappeared entirely at the end
+    if winner == "unknown":
+        last_frames = game_states[-10:] if len(game_states) >= 10 else game_states
+        p1_none_count = sum(1 for s in last_frames if s.get("p1_percent") is None)
+        p2_none_count = sum(1 for s in last_frames if s.get("p2_percent") is None)
+        
+        # If one player's data disappeared first, they got KO'd
+        if p1_none_count > p2_none_count + 3:
+            winner = "p2"  # P1 disappeared = P1 KO'd = P2 wins
+        elif p2_none_count > p1_none_count + 3:
+            winner = "p1"  # P2 disappeared = P2 KO'd = P1 wins
+    
+    # Get final stock counts from valid frames
     def get_mode(lst):
         if not lst:
             return None
         return max(set(lst), key=lst.count)
     
-    p1_stocks = get_mode(p1_final_stocks_list)
-    p2_stocks = get_mode(p2_final_stocks_list)
-    
-    # Signal 1: Stock count
-    p1_zero_count = sum(1 for s in last_frames if s.get("p1_stocks") == 0)
-    p2_zero_count = sum(1 for s in last_frames if s.get("p2_stocks") == 0)
-    
-    winner = "unknown"
-    
-    if p1_zero_count > len(last_frames) // 2:
-        winner = "p2"
-    elif p2_zero_count > len(last_frames) // 2:
-        winner = "p1"
-    elif p1_stocks is not None and p2_stocks is not None:
-        if p1_stocks > p2_stocks:
-            winner = "p1"
-        elif p2_stocks > p1_stocks:
-            winner = "p2"
-    
-    # Signal 2: If stocks are tied/unknown, check percent pattern at end
-    # The loser typically has high/rising percent before the final KO
-    # The winner often resets to low percent after taking opponent's stock
-    if winner == "unknown":
-        last_p1 = [s.get("p1_percent") for s in last_frames[-5:] if s.get("p1_percent") is not None]
-        last_p2 = [s.get("p2_percent") for s in last_frames[-5:] if s.get("p2_percent") is not None]
-        
-        if last_p1 and last_p2:
-            avg_p1 = sum(last_p1) / len(last_p1)
-            avg_p2 = sum(last_p2) / len(last_p2)
-            
-            # If one player is consistently at 0% while other has damage at end
-            # they likely just took a stock (winner scenario)
-            if avg_p1 < 5 and avg_p2 > 20:
-                winner = "p1"  # P1 at 0%, P2 had damage = P1 likely won
-            elif avg_p2 < 5 and avg_p1 > 20:
-                winner = "p2"  # P2 at 0%, P1 had damage = P2 likely won
-    
-    # Signal 3: Check if one player's percent goes to None at the end (character KO'd)
-    # THIS IS THE MOST RELIABLE SIGNAL - when a player is KO'd, their percent stops showing
-    p2_none_at_end = sum(1 for s in last_frames[-8:] if s.get("p2_percent") is None)
-    p1_none_at_end = sum(1 for s in last_frames[-8:] if s.get("p1_percent") is None)
-    
-    # If one player's percent disappeared while other's is still showing, that's a clear KO
-    if p2_none_at_end >= 5 and p1_none_at_end < 3:
-        winner = "p1"  # P2's percent disappeared = P2 KO'd = P1 wins
-    elif p1_none_at_end >= 5 and p2_none_at_end < 3:
-        winner = "p2"  # P1's percent disappeared = P1 KO'd = P2 wins
-    
-    # Signal 4: Check if stock icons disappeared (secondary KO signal)
-    # When KO'd, the small head icons below the name also disappear
-    if winner == "unknown":
-        # Check if one player's stocks became None/0 while other still has stocks
-        p1_has_stocks = sum(1 for s in last_frames[-5:] if s.get("p1_stocks") and s.get("p1_stocks") > 0)
-        p2_has_stocks = sum(1 for s in last_frames[-5:] if s.get("p2_stocks") and s.get("p2_stocks") > 0)
-        p1_no_stocks = sum(1 for s in last_frames[-5:] if s.get("p1_stocks") == 0 or s.get("p1_stocks") is None)
-        p2_no_stocks = sum(1 for s in last_frames[-5:] if s.get("p2_stocks") == 0 or s.get("p2_stocks") is None)
-        
-        if p2_no_stocks >= 3 and p1_has_stocks >= 2:
-            winner = "p1"  # P2 has no stocks, P1 still does = P1 wins
-        elif p1_no_stocks >= 3 and p2_has_stocks >= 2:
-            winner = "p2"  # P1 has no stocks, P2 still does = P2 wins
+    last_frames = game_states[-15:] if len(game_states) >= 15 else game_states
+    p1_final_stocks_list = [s.get("p1_stocks") for s in last_frames if s.get("p1_stocks") is not None]
+    p2_final_stocks_list = [s.get("p2_stocks") for s in last_frames if s.get("p2_stocks") is not None]
     
     stats["winner"] = winner
-    stats["p1_final_stocks"] = p1_stocks
-    stats["p2_final_stocks"] = p2_stocks
+    stats["p1_final_stocks"] = get_mode(p1_final_stocks_list)
+    stats["p2_final_stocks"] = get_mode(p2_final_stocks_list)
     
     return stats
 
