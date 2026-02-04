@@ -275,21 +275,33 @@ def calculate_stats(game_states: list) -> dict:
             elif p2_min < p1_min:
                 winner = "p1"  # P2 lost more stocks = P1 wins
     
-    # FALLBACK 2: Check who had higher percent at the end (they likely died)
+    # FALLBACK 2: When both stocks go to 0 simultaneously (GAME! screen)
+    # Look for who had the last valid stock reading of 1 while other showed 0
+    # If that doesn't exist, check percent stability in final frames
     if winner == "unknown":
-        last_frames = game_states[-15:] if len(game_states) >= 15 else game_states
-        p1_final_pcts = [s.get("p1_percent") for s in last_frames if s.get("p1_percent") is not None]
-        p2_final_pcts = [s.get("p2_percent") for s in last_frames if s.get("p2_percent") is not None]
+        # Check for any frame where stocks are unequal near the end
+        for s in reversed(game_states[-20:]):
+            p1_s = s.get("p1_stocks")
+            p2_s = s.get("p2_stocks")
+            if p1_s is not None and p2_s is not None and p1_s != p2_s:
+                if p1_s > p2_s:
+                    winner = "p1"  # P1 had more stocks at some point
+                else:
+                    winner = "p2"  # P2 had more stocks at some point
+                break
+    
+    # FALLBACK 3: Count how many frames each player's data is missing at the end
+    # The player who got KO'd might have their data disappear sooner
+    if winner == "unknown":
+        last_frames = game_states[-10:] if len(game_states) >= 10 else game_states
+        p1_valid = sum(1 for s in last_frames if s.get("p1_percent") is not None and s.get("p1_stocks") is not None)
+        p2_valid = sum(1 for s in last_frames if s.get("p2_percent") is not None and s.get("p2_stocks") is not None)
         
-        if p1_final_pcts and p2_final_pcts:
-            p1_max_end = max(p1_final_pcts)
-            p2_max_end = max(p2_final_pcts)
-            
-            # Higher percent at end = likely got KO'd = lost
-            if p1_max_end > p2_max_end + 20:
-                winner = "p2"  # P1 at higher percent = P1 likely died = P2 wins
-            elif p2_max_end > p1_max_end + 20:
-                winner = "p1"  # P2 at higher percent = P2 likely died = P1 wins
+        # Player with MORE valid readings at end is more likely the winner (still active)
+        if p1_valid > p2_valid + 2:
+            winner = "p1"  # P1 has more stable data = P1 likely survived
+        elif p2_valid > p1_valid + 2:
+            winner = "p2"  # P2 has more stable data = P2 likely survived
     
     # Get final stock counts
     def get_mode(lst):
