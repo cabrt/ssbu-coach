@@ -27,7 +27,7 @@ except ImportError:
 
 def extract_frames_cloud_v2(
     video_path: str,
-    fps_sample: float = 1.0,
+    fps_sample: float = 2.0,  # 2 fps for better accuracy on peak percentages
     progress_callback: Callable[[float], None] = None,
     max_duration: int = None,
     batch_size: int = 8,  # Smaller batches for better accuracy
@@ -312,18 +312,16 @@ def _validate_states(states: List[dict]) -> List[dict]:
             elif last_p2 > 0 and p2 > last_p2 + 80:
                 p2 = None
         
-        # Validate stocks
+        # Validate stocks (don't allow increase, but DO allow decrease to 0)
         if p1_stocks is not None:
             if p1_stocks > last_p1_stocks:
-                p1_stocks = last_p1_stocks
-            elif p1_stocks < last_p1_stocks - 1:
-                p1_stocks = last_p1_stocks - 1
+                p1_stocks = last_p1_stocks  # Can't gain stocks
+            # Allow decrease to any value (including 0) - stock can drop 2 at once in rare cases
         
         if p2_stocks is not None:
             if p2_stocks > last_p2_stocks:
-                p2_stocks = last_p2_stocks
-            elif p2_stocks < last_p2_stocks - 1:
-                p2_stocks = last_p2_stocks - 1
+                p2_stocks = last_p2_stocks  # Can't gain stocks
+            # Allow decrease to any value (including 0)
         
         state["p1_percent"] = p1
         state["p2_percent"] = p2
@@ -346,7 +344,7 @@ def _validate_states(states: List[dict]) -> List[dict]:
 
 def process_video(
     video_path: str,
-    fps_sample: float = 1.0,
+    fps_sample: float = 2.0,  # 2 fps for better accuracy
     progress_callback: Callable[[float], None] = None,
     max_duration: int = None
 ) -> List[dict]:

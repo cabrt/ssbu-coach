@@ -229,79 +229,73 @@ def calculate_stats(game_states: list) -> dict:
         "p2_avg_percent": sum(p2_percents) / len(p2_percents) if p2_percents else 0,
     }
     
+    # WINNER DETECTION: Simple rule - whoever has 0 stocks at the end LOST
+    # The game NEVER ends with both players alive
     winner = "unknown"
     
-    # BEST SIGNAL: Find the moment when one player goes from 1 stock to 0
-    # while the other still has 1+ stocks - this is the game-ending KO
-    for i in range(1, len(game_states)):
-        prev = game_states[i - 1]
-        curr = game_states[i]
+    # Method 1: Look at ALL frames and find who reaches 0 stocks FIRST
+    # (while the other player still has stocks remaining)
+    for i, state in enumerate(game_states):
+        p1_stocks = state.get("p1_stocks")
+        p2_stocks = state.get("p2_stocks")
         
-        p1_prev_stocks = prev.get("p1_stocks")
-        p1_curr_stocks = curr.get("p1_stocks")
-        p2_prev_stocks = prev.get("p2_stocks")
-        p2_curr_stocks = curr.get("p2_stocks")
-        
-        # P1 went from 1 to 0 while P2 still has stocks
-        if (p1_prev_stocks == 1 and p1_curr_stocks == 0 and 
-            p2_prev_stocks is not None and p2_prev_stocks >= 1):
-            winner = "p2"  # P1 lost final stock = P2 wins
+        # P1 at 0 stocks while P2 still has stocks = P2 wins
+        if p1_stocks == 0 and p2_stocks is not None and p2_stocks >= 1:
+            winner = "p2"
+            print(f"[Winner] P1 at 0 stocks while P2 has {p2_stocks} at {state['timestamp']}s -> P2 wins")
             break
         
-        # P2 went from 1 to 0 while P1 still has stocks
-        if (p2_prev_stocks == 1 and p2_curr_stocks == 0 and 
-            p1_prev_stocks is not None and p1_prev_stocks >= 1):
-            winner = "p1"  # P2 lost final stock = P1 wins
+        # P2 at 0 stocks while P1 still has stocks = P1 wins
+        if p2_stocks == 0 and p1_stocks is not None and p1_stocks >= 1:
+            winner = "p1"
+            print(f"[Winner] P2 at 0 stocks while P1 has {p1_stocks} at {state['timestamp']}s -> P1 wins")
             break
     
-    # FALLBACK 1: Check who had fewer stocks in the last valid frames
+    # Method 2: If no clear 0-vs-1+ found, look at the last valid stock readings
+    # Find who had fewer stocks in the final portion of the match
     if winner == "unknown":
-        # Find frames where at least one player has stocks > 0
-        valid_stock_frames = [s for s in game_states 
-            if (s.get("p1_stocks") is not None and s.get("p1_stocks") > 0) or 
-               (s.get("p2_stocks") is not None and s.get("p2_stocks") > 0)]
+        # Get last 30 frames to look for stock differences
+        last_frames = game_states[-30:] if len(game_states) >= 30 else game_states
         
-        if valid_stock_frames:
-            last_valid = valid_stock_frames[-10:] if len(valid_stock_frames) >= 10 else valid_stock_frames
+        for state in reversed(last_frames):
+            p1_s = state.get("p1_stocks")
+            p2_s = state.get("p2_stocks")
             
-            p1_stocks_list = [s.get("p1_stocks") for s in last_valid if s.get("p1_stocks") is not None]
-            p2_stocks_list = [s.get("p2_stocks") for s in last_valid if s.get("p2_stocks") is not None]
-            
-            p1_min = min(p1_stocks_list) if p1_stocks_list else 3
-            p2_min = min(p2_stocks_list) if p2_stocks_list else 3
-            
-            if p1_min < p2_min:
-                winner = "p2"  # P1 lost more stocks = P2 wins
-            elif p2_min < p1_min:
-                winner = "p1"  # P2 lost more stocks = P1 wins
-    
-    # FALLBACK 2: When both stocks go to 0 simultaneously (GAME! screen)
-    # Look for who had the last valid stock reading of 1 while other showed 0
-    # If that doesn't exist, check percent stability in final frames
-    if winner == "unknown":
-        # Check for any frame where stocks are unequal near the end
-        for s in reversed(game_states[-20:]):
-            p1_s = s.get("p1_stocks")
-            p2_s = s.get("p2_stocks")
             if p1_s is not None and p2_s is not None and p1_s != p2_s:
-                if p1_s > p2_s:
-                    winner = "p1"  # P1 had more stocks at some point
+                if p1_s < p2_s:
+                    winner = "p2"  # P1 has fewer stocks = P2 wins
                 else:
-                    winner = "p2"  # P2 had more stocks at some point
+                    winner = "p1"  # P2 has fewer stocks = P1 wins
+                print(f"[Winner] Stock difference found: P1={p1_s}, P2={p2_s} -> {winner} wins")
                 break
     
-    # FALLBACK 3: Count how many frames each player's data is missing at the end
-    # The player who got KO'd might have their data disappear sooner
+    # Method 3: Count total stock losses throughout the match
     if winner == "unknown":
-        last_frames = game_states[-10:] if len(game_states) >= 10 else game_states
-        p1_valid = sum(1 for s in last_frames if s.get("p1_percent") is not None and s.get("p1_stocks") is not None)
-        p2_valid = sum(1 for s in last_frames if s.get("p2_percent") is not None and s.get("p2_stocks") is not None)
+        p1_stock_losses = 0
+        p2_stock_losses = 0
         
-        # Player with MORE valid readings at end is more likely the winner (still active)
-        if p1_valid > p2_valid + 2:
-            winner = "p1"  # P1 has more stable data = P1 likely survived
-        elif p2_valid > p1_valid + 2:
-            winner = "p2"  # P2 has more stable data = P2 likely survived
+        for i in range(1, len(game_states)):
+            prev = game_states[i - 1]
+            curr = game_states[i]
+            
+            p1_prev = prev.get("p1_stocks")
+            p1_curr = curr.get("p1_stocks")
+            p2_prev = prev.get("p2_stocks")
+            p2_curr = curr.get("p2_stocks")
+            
+            # Count when stocks decrease
+            if p1_prev is not None and p1_curr is not None and p1_curr < p1_prev:
+                p1_stock_losses += (p1_prev - p1_curr)
+            if p2_prev is not None and p2_curr is not None and p2_curr < p2_prev:
+                p2_stock_losses += (p2_prev - p2_curr)
+        
+        # Player who lost more stocks = lost the game
+        if p1_stock_losses > p2_stock_losses:
+            winner = "p2"
+            print(f"[Winner] P1 lost {p1_stock_losses} stocks, P2 lost {p2_stock_losses} -> P2 wins")
+        elif p2_stock_losses > p1_stock_losses:
+            winner = "p1"
+            print(f"[Winner] P1 lost {p1_stock_losses} stocks, P2 lost {p2_stock_losses} -> P1 wins")
     
     # Get final stock counts
     def get_mode(lst):
@@ -316,6 +310,8 @@ def calculate_stats(game_states: list) -> dict:
     stats["winner"] = winner
     stats["p1_final_stocks"] = get_mode(p1_final_stocks_list)
     stats["p2_final_stocks"] = get_mode(p2_final_stocks_list)
+    
+    print(f"[Stats] Final stocks: P1={stats['p1_final_stocks']}, P2={stats['p2_final_stocks']}, Winner={winner}")
     
     return stats
 
