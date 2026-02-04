@@ -174,10 +174,6 @@ def generate_coaching(game_states: list, player_char: str = None, opponent_char:
     your_max = raw_stats.get("p1_max_percent", 0) or patterns.get("p1_true_max_percent", 0)
     opp_max = raw_stats.get("p2_max_percent", 0) or patterns.get("p2_true_max_percent", 0)
     
-    print(f"[DEBUG Coaching] raw_stats p1_max: {raw_stats.get('p1_max_percent')}, p2_max: {raw_stats.get('p2_max_percent')}")
-    print(f"[DEBUG Coaching] patterns p1_true_max: {patterns.get('p1_true_max_percent')}, p2_true_max: {patterns.get('p2_true_max_percent')}")
-    print(f"[DEBUG Coaching] FINAL your_max: {your_max}, opp_max: {opp_max}")
-    
     stats = {
         "duration": raw_stats.get("duration", 0),
         "your_max_percent": round(your_max, 1) if isinstance(your_max, float) else your_max,
