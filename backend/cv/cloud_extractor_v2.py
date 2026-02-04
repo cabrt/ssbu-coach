@@ -305,12 +305,17 @@ def _validate_states(states: List[dict]) -> List[dict]:
     game_ended = False
     
     for state in states[start_idx:]:
+        # CRITICAL: Always keep frames where someone has 0 stocks (game end)
+        raw_p1_stocks = state.get("p1_stocks")
+        raw_p2_stocks = state.get("p2_stocks")
+        is_game_ending_frame = (raw_p1_stocks == 0 or raw_p2_stocks == 0)
+        
         # Skip pre-game frames, but KEEP end-game frames (game_active=false after game started)
         if not state.get("game_active", True):
-            if game_ended:
-                # Already processed end-game, skip further frames
+            if game_ended and not is_game_ending_frame:
+                # Already processed end-game, skip further frames (but always keep 0-stock frames)
                 continue
-            elif last_p1_stocks > 0 or last_p2_stocks > 0:
+            elif is_game_ending_frame or last_p1_stocks > 0 or last_p2_stocks > 0:
                 # This is an end-game frame (GAME! screen) - process it for stock counts
                 game_ended = True
                 # Fall through to process this frame
