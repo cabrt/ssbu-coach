@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.env
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Data files (large videos and frames)
+data/videos/*.mp4
+data/videos/*.mov
+data/videos/*.webm
+data/frames/
+*.jpg
+*.png
+
+# Keep saved analyses structure but not the files
+data/saved_analyses/*.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
