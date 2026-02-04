@@ -56,7 +56,7 @@ def process_video(
             from cv.cloud_extractor_v2 import extract_frames_cloud_v2
             
             # Use 2.0 fps for better accuracy capturing peak percentages
-            actual_fps = max(fps_sample, 1.0)  # 1 fps to reduce API calls
+            actual_fps = max(fps_sample, 2.0)  # 2 fps for better accuracy
             print(f"[VideoProcessor] Using fps_sample={actual_fps}")
             
             states = extract_frames_cloud_v2(

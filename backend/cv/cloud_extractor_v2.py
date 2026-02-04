@@ -27,10 +27,10 @@ except ImportError:
 
 def extract_frames_cloud_v2(
     video_path: str,
-    fps_sample: float = 1.0,  # 1 fps to reduce API calls (rate limits)
+    fps_sample: float = 2.0,  # 2 fps for better accuracy on peak percentages
     progress_callback: Callable[[float], None] = None,
     max_duration: int = None,
-    batch_size: int = 12,  # Larger batches to reduce API calls
+    batch_size: int = 8,  # Smaller batches for better accuracy
     max_parallel_batches: int = 1,  # Sequential to avoid rate limits
 ) -> List[dict]:
     """
@@ -79,9 +79,9 @@ def extract_frames_cloud_v2(
             
             print(f"[CloudExtractor v2] Batch {batch_idx + 1}/{len(batches)}: {len(states)} states")
             
-            # Wait between batches to respect rate limits (Gemini free tier: ~15 req/min)
+            # Wait between batches (paid tier has much higher limits)
             if batch_idx < len(batches) - 1:
-                time_module.sleep(5)  # 5 seconds between batches = 12 req/min (safe)
+                time_module.sleep(1)  # 1 second between batches
                 
         except Exception as e:
             print(f"[CloudExtractor v2] Batch {batch_idx} error: {e}")
