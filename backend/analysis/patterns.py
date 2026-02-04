@@ -17,6 +17,41 @@ def find_patterns(game_states: list) -> dict:
     if len(game_states) < 2:
         return patterns
     
+    # Build a lookup of RAW max percent by timestamp range
+    # This ensures we capture peak values that smoothing might remove
+    raw_p1_max_by_time = {}  # timestamp -> max p1 percent in preceding window
+    raw_p2_max_by_time = {}  # timestamp -> max p2 percent in preceding window
+    
+    running_p1_max = 0
+    running_p2_max = 0
+    last_p1_reset = 0  # timestamp of last percent reset (death)
+    last_p2_reset = 0
+    
+    for state in game_states:
+        t = state["timestamp"]
+        p1 = state.get("p1_percent")
+        p2 = state.get("p2_percent")
+        
+        # Track max for P1 (reset when percent drops significantly = death)
+        if p1 is not None:
+            if p1 < 20 and running_p1_max > 50:
+                # Death occurred - record max and reset
+                last_p1_reset = t
+                running_p1_max = p1
+            else:
+                running_p1_max = max(running_p1_max, p1)
+        raw_p1_max_by_time[t] = running_p1_max
+        
+        # Track max for P2 (reset when percent drops significantly = death)
+        if p2 is not None:
+            if p2 < 20 and running_p2_max > 50:
+                # Death occurred - record max and reset
+                last_p2_reset = t
+                running_p2_max = p2
+            else:
+                running_p2_max = max(running_p2_max, p2)
+        raw_p2_max_by_time[t] = running_p2_max
+    
     # first, smooth out the game states to reduce noise
     smoothed_states = smooth_game_states(game_states)
     
@@ -247,20 +282,23 @@ def find_patterns(game_states: list) -> dict:
         )
         
         if stock_loss_detected:
+            # Use RAW max percent (not smoothed) for accurate death percent
+            raw_p1_max = raw_p1_max_by_time.get(timestamp, p1_max_recent_percent)
             patterns["stock_losses"].append({
                 "timestamp": timestamp,
-                "percent": p1_max_recent_percent,
+                "percent": raw_p1_max,
                 "stocks_remaining": stock_loss_detected["new_stocks"]
             })
             confirmed_p1_stocks = stock_loss_detected["new_stocks"]
             p1_max_recent_percent = 0
             prev_p1_percent = 0
         elif percent_reset_death:
-            # Use fallback detection
+            # Use fallback detection with raw max
             confirmed_p1_stocks = max(0, confirmed_p1_stocks - 1)
+            raw_p1_max = raw_p1_max_by_time.get(timestamp, percent_reset_death["death_percent"])
             patterns["stock_losses"].append({
                 "timestamp": timestamp,
-                "percent": percent_reset_death["death_percent"],
+                "percent": raw_p1_max,
                 "stocks_remaining": confirmed_p1_stocks
             })
             p1_max_recent_percent = 0
@@ -278,9 +316,11 @@ def find_patterns(game_states: list) -> dict:
         )
         
         if opp_stock_loss:
+            # Use RAW max percent (not smoothed) for accurate kill percent
+            raw_p2_max = raw_p2_max_by_time.get(timestamp, p2_max_recent_percent)
             patterns["kills"].append({
                 "timestamp": timestamp,
-                "opponent_percent": p2_max_recent_percent,
+                "opponent_percent": raw_p2_max,
                 "opponent_stocks_remaining": opp_stock_loss["new_stocks"]
             })
             confirmed_p2_stocks = opp_stock_loss["new_stocks"]
@@ -288,9 +328,10 @@ def find_patterns(game_states: list) -> dict:
             prev_p2_percent = 0
         elif opp_percent_reset:
             confirmed_p2_stocks = max(0, confirmed_p2_stocks - 1)
+            raw_p2_max = raw_p2_max_by_time.get(timestamp, opp_percent_reset["death_percent"])
             patterns["kills"].append({
                 "timestamp": timestamp,
-                "opponent_percent": opp_percent_reset["death_percent"],
+                "opponent_percent": raw_p2_max,
                 "opponent_stocks_remaining": confirmed_p2_stocks
             })
             p2_max_recent_percent = 0
