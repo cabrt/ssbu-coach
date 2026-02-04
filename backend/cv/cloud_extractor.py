@@ -215,7 +215,7 @@ def _process_batch_gemini(batch: FrameBatch) -> ExtractionResult:
     """Process a batch of frames using Gemini 1.5 Flash."""
     start_time = time.time()
     
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    model = genai.GenerativeModel('gemini-2.0-flash')
     
     # Build the prompt with all frame images
     prompt_parts = [
