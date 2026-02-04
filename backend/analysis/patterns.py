@@ -620,12 +620,15 @@ def detect_stock_loss(game_states: list, current_idx: int, player: str,
     Validation criteria:
     1. Stock count decreased from confirmed value
     2. Player had meaningful percent before (>= 50%)
-    3. Stock decrease persists for 4+ frames
-    4. Percent MUST reset to <15% after the loss
+    3. Stock decrease persists for 4+ frames (relaxed for end-of-video)
+    4. Percent MUST reset to <15% after the loss (relaxed for final death)
     5. Stock was higher for 2+ frames before this point
     """
-    if current_idx < 3 or current_idx >= len(game_states) - 4:
+    if current_idx < 3:
         return None
+    
+    # Check if we're near the end of the video (last 10% of frames)
+    near_end_of_video = current_idx >= len(game_states) * 0.9
     
     state = game_states[current_idx]
     timestamp = state["timestamp"]
@@ -662,7 +665,7 @@ def detect_stock_loss(game_states: list, current_idx: int, player: str,
     if prev_higher_count < 2:
         return None
     
-    # validation 3: check that the stock loss persists for 4+ frames AFTER
+    # validation 3: check that the stock loss persists for some frames AFTER
     frames_to_check = min(5, len(game_states) - current_idx - 1)
     persisting_low_stock = 0
     
@@ -672,9 +675,14 @@ def detect_stock_loss(game_states: list, current_idx: int, player: str,
         if future_stocks is not None and future_stocks <= current_stocks:
             persisting_low_stock += 1
     
-    # require at least 4 frames confirming lower stock count
-    if persisting_low_stock < 4:
+    # Relaxed requirement near end of video (final death may not have many frames after)
+    required_persisting = 1 if near_end_of_video else 4
+    if persisting_low_stock < required_persisting and frames_to_check >= required_persisting:
         return None
+    
+    # If going to 0 stocks (final death), skip percent reset check - game ends
+    if current_stocks == 0:
+        return {"new_stocks": current_stocks}
     
     # validation 4: percent MUST reset to <15% within the next few frames
     percent_reset_confirmed = False
