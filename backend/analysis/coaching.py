@@ -169,9 +169,10 @@ def generate_coaching(game_states: list, player_char: str = None, opponent_char:
     summary, enhanced_tips = generate_ai_coaching(raw_stats, patterns, tips, player_char, opponent_char)
     
     # Normalize stats for frontend: always "your" and "opponent" (no p1/p2)
-    # Use true max from patterns (tracks global max, not reset on death)
-    your_max = patterns.get("p1_true_max_percent") or raw_stats.get("p1_max_percent", 0)
-    opp_max = patterns.get("p2_true_max_percent") or raw_stats.get("p2_max_percent", 0)
+    # Use raw stats max (unsmoothed) - this is the TRUE maximum percent reached
+    # Pattern's true_max uses smoothed data which can be lower
+    your_max = raw_stats.get("p1_max_percent", 0) or patterns.get("p1_true_max_percent", 0)
+    opp_max = raw_stats.get("p2_max_percent", 0) or patterns.get("p2_true_max_percent", 0)
     
     stats = {
         "duration": raw_stats.get("duration", 0),
