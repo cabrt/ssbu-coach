@@ -125,11 +125,11 @@ export default function AnalysisResults({ analysis, videoUrl, onReset }) {
           </div>
           <div className="stat-card">
             <div className="stat-value">{yourMaxPercent}%</div>
-            <div className="stat-label">Your Max Damage</div>
+            <div className="stat-label">Max Damage Taken</div>
           </div>
           <div className="stat-card">
             <div className="stat-value">{opponentMaxPercent}%</div>
-            <div className="stat-label">Opponent Max</div>
+            <div className="stat-label">Max Damage Dealt</div>
           </div>
           <div className="stat-card">
             <div className="stat-value">{youWon ? 'Won' : 'Lost'}</div>

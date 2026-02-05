@@ -10,6 +10,10 @@ def find_patterns(game_states: list) -> dict:
         "long_neutral": [],
         "comebacks": [],
         "combos": [],
+        "edgeguards": [],         # successful offstage plays (you edgeguarding opponent)
+        "got_edgeguarded": [],    # when opponent edgeguarded you
+        "recovery_moments": [],   # when you recovered after being hit offstage
+        "momentum_swings": [],    # significant shifts in match momentum
         "game_start": None,
         "game_end": None,
     }
@@ -88,10 +92,13 @@ def find_patterns(game_states: list) -> dict:
     confirmed_p2_stocks = 3
     game_over = False  # Set to True AFTER recording final death/kill
     neutral_start = None
+    neutral_start_p1 = 0
+    neutral_start_p2 = 0
     combo_start = None
     combo_damage = 0
     combo_hits = 0
     combo_from_percent = 0
+    combo_end_percent = 0
     
     # track recent high percents for stock loss validation
     p1_max_recent_percent = 0
@@ -120,8 +127,18 @@ def find_patterns(game_states: list) -> dict:
         timestamp = state["timestamp"]
         
         # track maximum percent reached (for validating stock losses)
-        p1_max_recent_percent = max(p1_max_recent_percent, p1_percent)
-        p2_max_recent_percent = max(p2_max_recent_percent, p2_percent)
+        # CRITICAL: Use RAW data for max percent tracking, not smoothed
+        # Smoothing can reduce brief spikes before death (e.g. 68% -> 38% median)
+        # which causes deaths to fail validation
+        raw_idx = timestamp_to_raw_idx.get(timestamp, i)
+        if raw_idx < len(game_states):
+            raw_p1_pct = game_states[raw_idx].get("p1_percent") or 0
+            raw_p2_pct = game_states[raw_idx].get("p2_percent") or 0
+            p1_max_recent_percent = max(p1_max_recent_percent, raw_p1_pct, p1_percent)
+            p2_max_recent_percent = max(p2_max_recent_percent, raw_p2_pct, p2_percent)
+        else:
+            p1_max_recent_percent = max(p1_max_recent_percent, p1_percent)
+            p2_max_recent_percent = max(p2_max_recent_percent, p2_percent)
         
         # track GLOBAL max (never resets, for accurate stats)
         global_p1_max = max(global_p1_max, p1_percent)
@@ -179,25 +196,29 @@ def find_patterns(game_states: list) -> dict:
             if you_got_hit:
                 # You got hit while dealing damage - not a true combo, reset
                 if combo_start and combo_hits >= 3 and combo_damage > 25:
+                    # Use ACTUAL p2_percent, not calculated value
+                    actual_to_percent = prev_p2_percent if prev_p2_percent else combo_from_percent + combo_damage
                     patterns["combos"].append({
                         "start": combo_start,
                         "end": prev_timestamp if 'prev_timestamp' in dir() else timestamp,
                         "damage": min(combo_damage, 100),
                         "from_percent": combo_from_percent,
-                        "to_percent": min(combo_from_percent + combo_damage, 200),
+                        "to_percent": actual_to_percent,
                         "hits": combo_hits
                     })
                 combo_start = None
                 combo_damage = 0
                 combo_hits = 0
                 combo_from_percent = 0
+                combo_end_percent = 0
             else:
                 # Continue or start combo
                 if combo_start is None:
                     combo_start = timestamp
-                    combo_from_percent = prev_p2_percent
+                    combo_from_percent = prev_p2_percent if prev_p2_percent else 0
                     combo_damage = capped_p2_damage
                     combo_hits = 1
+                    combo_end_percent = p2_percent if p2_percent else combo_from_percent + capped_p2_damage
                 else:
                     # Check if too much time passed (>5 seconds = not a combo)
                     if timestamp - combo_start > 5:
@@ -208,16 +229,18 @@ def find_patterns(game_states: list) -> dict:
                                 "end": prev_timestamp if 'prev_timestamp' in dir() else timestamp,
                                 "damage": min(combo_damage, 100),
                                 "from_percent": combo_from_percent,
-                                "to_percent": min(combo_from_percent + combo_damage, 200),
+                                "to_percent": combo_end_percent,
                                 "hits": combo_hits
                             })
                         combo_start = timestamp
-                        combo_from_percent = prev_p2_percent
+                        combo_from_percent = prev_p2_percent if prev_p2_percent else 0
                         combo_damage = capped_p2_damage
                         combo_hits = 1
+                        combo_end_percent = p2_percent if p2_percent else combo_from_percent + capped_p2_damage
                     else:
                         combo_damage += capped_p2_damage
                         combo_hits += 1
+                        combo_end_percent = p2_percent if p2_percent else combo_end_percent + capped_p2_damage
         elif you_got_hit:
             # You got hit without dealing damage - combo broken
             if combo_start and combo_hits >= 3 and combo_damage > 25:
@@ -226,13 +249,14 @@ def find_patterns(game_states: list) -> dict:
                     "end": prev_timestamp if 'prev_timestamp' in dir() else timestamp,
                     "damage": min(combo_damage, 100),
                     "from_percent": combo_from_percent,
-                    "to_percent": min(combo_from_percent + combo_damage, 200),
+                    "to_percent": combo_end_percent if 'combo_end_percent' in dir() and combo_end_percent else prev_p2_percent,
                     "hits": combo_hits
                 })
             combo_start = None
             combo_damage = 0
             combo_hits = 0
             combo_from_percent = 0
+            combo_end_percent = 0
         else:
             # No damage either way - check if combo timed out
             if combo_start and timestamp - combo_start > 3:
@@ -243,13 +267,14 @@ def find_patterns(game_states: list) -> dict:
                         "end": prev_timestamp if 'prev_timestamp' in dir() else timestamp,
                         "damage": min(combo_damage, 100),
                         "from_percent": combo_from_percent,
-                        "to_percent": min(combo_from_percent + combo_damage, 200),
+                        "to_percent": combo_end_percent if 'combo_end_percent' in dir() and combo_end_percent else prev_p2_percent,
                         "hits": combo_hits
                     })
                 combo_start = None
                 combo_damage = 0
                 combo_hits = 0
                 combo_from_percent = 0
+                combo_end_percent = 0
         
         prev_timestamp = timestamp
         
@@ -389,20 +414,201 @@ def find_patterns(game_states: list) -> dict:
                             patterns["game_end"] = timestamp
                             game_over = True
         
+        # EDGEGUARD DETECTION: Identify likely offstage kills vs center-stage kills
+        # True edgeguards have specific characteristics we can infer without position data:
+        # 1. Kill percent typically 50-140% (edgeguards kill earlier than center-stage)
+        # 2. You didn't deal much damage RIGHT before the kill (not a combo finisher)
+        # 3. Opponent's percent was relatively stable before the kill (they were recovering)
+        if opp_stock_loss or opp_percent_reset:
+            kill_percent = opp_stock_loss.get("death_percent") if opp_stock_loss else opp_percent_reset.get("death_percent", 0)
+            if kill_percent is None:
+                kill_percent = 0
+            
+            # Check damage you took recently (within 3 seconds) - trade detection
+            your_damage_during_kill = 0
+            lookback_start = max(0, i - 10)  # ~3 seconds at 3fps
+            for j in range(lookback_start, i):
+                if j > 0:
+                    prev_your_pct = smoothed_states[j-1].get("p1_percent") or 0
+                    curr_your_pct = smoothed_states[j].get("p1_percent") or 0
+                    your_damage_during_kill += max(0, curr_your_pct - prev_your_pct)
+            
+            # Check damage you DEALT in the last 5 seconds - combo detection
+            damage_dealt_before_kill = 0
+            combo_lookback = max(0, i - 15)  # ~5 seconds at 3fps
+            for j in range(combo_lookback, i):
+                if j > 0:
+                    prev_opp_pct = smoothed_states[j-1].get("p2_percent") or 0
+                    curr_opp_pct = smoothed_states[j].get("p2_percent") or 0
+                    damage_dealt_before_kill += max(0, curr_opp_pct - prev_opp_pct)
+            
+            # Edgeguard heuristics:
+            # - Kill percent 50-145%: Edgeguards typically kill early due to offstage positioning
+            #   Kills at 150%+ are usually center-stage finishers after opponent lived long
+            # - Low damage dealt before: If you dealt 30%+ damage in combo, it's a combo finisher
+            # - Low damage taken: Taking some damage is OK (small trades happen in edgeguards)
+            is_edgeguard_percent = 50 <= kill_percent <= 145
+            is_not_combo_kill = damage_dealt_before_kill < 30
+            is_clean_kill = your_damage_during_kill <= 15  # Allow up to 15% (small trade)
+            
+            # Score-based detection: more criteria met = higher confidence
+            edgeguard_score = 0
+            if is_edgeguard_percent:
+                edgeguard_score += 1
+            if is_not_combo_kill:
+                edgeguard_score += 1
+            if is_clean_kill:
+                edgeguard_score += 1
+            if your_damage_during_kill < 5:  # Very clean = bonus
+                edgeguard_score += 1
+            
+            # Require at least 3 criteria to call it an edgeguard
+            if edgeguard_score >= 3:
+                patterns["edgeguards"].append({
+                    "timestamp": timestamp,
+                    "opponent_percent": kill_percent,
+                    "your_damage_taken": your_damage_during_kill,
+                    "damage_dealt_before": damage_dealt_before_kill,
+                    "is_likely_edgeguard": edgeguard_score >= 4,
+                    "confidence": edgeguard_score
+                })
+        
+        # RECOVERY TRACKING: After you lose a stock, track when you stabilize
+        if stock_loss_detected or percent_reset_death:
+            death_pct = stock_loss_detected.get("death_percent") if stock_loss_detected else percent_reset_death.get("death_percent", 0)
+            if death_pct is None:
+                death_pct = 0
+            
+            # Record the death moment for recovery tracking
+            patterns["recovery_moments"].append({
+                "timestamp": timestamp,
+                "death_percent": death_pct,
+                "stocks_remaining": confirmed_p1_stocks,
+                "type": "respawn_start"
+            })
+            
+            # OPPONENT EDGEGUARD DETECTION: When you die and opponent didn't take much damage
+            # This means opponent successfully edgeguarded you
+            opp_damage_during_your_death = 0
+            lookback_start = max(0, i - 10)  # ~3 seconds at 3fps
+            for j in range(lookback_start, i):
+                if j > 0:
+                    prev_opp_pct = smoothed_states[j-1].get("p2_percent") or 0
+                    curr_opp_pct = smoothed_states[j].get("p2_percent") or 0
+                    opp_damage_during_your_death += max(0, curr_opp_pct - prev_opp_pct)
+            
+            # Check damage opponent dealt to you before your death
+            damage_taken_before_death = 0
+            for j in range(lookback_start, i):
+                if j > 0:
+                    prev_your_pct = smoothed_states[j-1].get("p1_percent") or 0
+                    curr_your_pct = smoothed_states[j].get("p1_percent") or 0
+                    damage_taken_before_death += max(0, curr_your_pct - prev_your_pct)
+            
+            # Edgeguard heuristics (from opponent's perspective):
+            # - Your death percent 50-145% (edgeguards kill earlier)
+            # - Opponent didn't take damage (clean edgeguard)
+            # - Opponent didn't deal much damage right before (not a combo kill)
+            is_edgeguard_percent = 50 <= death_pct <= 145
+            is_clean_for_opponent = opp_damage_during_your_death < 15
+            is_not_combo = damage_taken_before_death < 30
+            
+            edgeguard_score = 0
+            if is_edgeguard_percent:
+                edgeguard_score += 1
+            if is_clean_for_opponent:
+                edgeguard_score += 1
+            if is_not_combo:
+                edgeguard_score += 1
+            if opp_damage_during_your_death < 5:
+                edgeguard_score += 1
+            
+            if edgeguard_score >= 3:
+                patterns["got_edgeguarded"] = patterns.get("got_edgeguarded", [])
+                patterns["got_edgeguarded"].append({
+                    "timestamp": timestamp,
+                    "your_death_percent": death_pct,
+                    "opponent_damage_taken": opp_damage_during_your_death,
+                    "damage_you_took_before": damage_taken_before_death,
+                    "confidence": edgeguard_score
+                })
+        
+        # MOMENTUM SWING DETECTION: Track when one player deals multiple hits without trading
+        if p2_damage_taken > 10 and p1_damage_taken < 5:
+            # You dealt damage without taking much back - positive momentum
+            if not patterns["momentum_swings"] or (timestamp - patterns["momentum_swings"][-1].get("timestamp", 0)) > 5:
+                patterns["momentum_swings"].append({
+                    "timestamp": timestamp,
+                    "type": "advantage",
+                    "damage_dealt": p2_damage_taken,
+                    "damage_taken": p1_damage_taken
+                })
+        elif p1_damage_taken > 20 and p2_damage_taken < 5:
+            # You took heavy damage without dealing back - negative momentum
+            if not patterns["momentum_swings"] or (timestamp - patterns["momentum_swings"][-1].get("timestamp", 0)) > 5:
+                patterns["momentum_swings"].append({
+                    "timestamp": timestamp,
+                    "type": "disadvantage", 
+                    "damage_dealt": p2_damage_taken,
+                    "damage_taken": p1_damage_taken
+                })
+        
         # detect long neutral (no significant damage for a while)
+        # IMPROVED: Stricter criteria - true neutral is usually 5-8 seconds max
         total_damage = p1_damage_taken + p2_damage_taken
         
-        if total_damage < 5:
+        # Don't count neutral if:
+        # 1. Either player is near 0% (likely respawning)
+        # 2. Percents look stuck (same as previous - could be OCR error)
+        # 3. Within 10 seconds of a stock loss (respawn invincibility + re-engagement)
+        is_respawn_period = (p1_percent < 5 or p2_percent < 5)
+        percents_look_stuck = (p1_percent == prev_p1_percent and p2_percent == prev_p2_percent)
+        
+        # Check if we're near a recent stock loss
+        recent_stock_loss = False
+        for sl in patterns.get("stock_losses", []):
+            if abs(timestamp - sl["timestamp"]) < 10:
+                recent_stock_loss = True
+                break
+        for k in patterns.get("kills", []):
+            if abs(timestamp - k["timestamp"]) < 10:
+                recent_stock_loss = True
+                break
+        
+        # Also check if there's been ANY damage in the last few frames (OCR might miss some)
+        recent_damage = False
+        for j in range(max(0, i-5), i):
+            s = smoothed_states[j]
+            if j > 0:
+                ps = smoothed_states[j-1]
+                if (s.get("p1_percent") or 0) > (ps.get("p1_percent") or 0) + 3:
+                    recent_damage = True
+                if (s.get("p2_percent") or 0) > (ps.get("p2_percent") or 0) + 3:
+                    recent_damage = True
+        
+        if total_damage < 3 and not is_respawn_period and not recent_stock_loss and not recent_damage:
             if neutral_start is None:
                 neutral_start = timestamp
+                neutral_start_p1 = p1_percent
+                neutral_start_p2 = p2_percent
         else:
-            if neutral_start and (timestamp - neutral_start) > 8:
-                patterns["long_neutral"].append({
-                    "start": neutral_start,
-                    "end": timestamp,
-                    "duration": timestamp - neutral_start
-                })
+            # Threshold reduced from 8 to 6 seconds for more accurate neutral detection
+            if neutral_start and (timestamp - neutral_start) > 6:
+                # Additional validation: at least one player's percent should have changed
+                # (indicates they were actually playing, not just OCR stuck)
+                p1_moved = abs(p1_percent - neutral_start_p1) > 2
+                p2_moved = abs(p2_percent - neutral_start_p2) > 2
+                
+                # Only record if there was some engagement (not totally stuck OCR)
+                if p1_moved or p2_moved:
+                    patterns["long_neutral"].append({
+                        "start": neutral_start,
+                        "end": timestamp,
+                        "duration": timestamp - neutral_start
+                    })
             neutral_start = None
+            neutral_start_p1 = 0
+            neutral_start_p2 = 0
         
         prev_p1_percent = p1_percent
         prev_p2_percent = p2_percent

@@ -55,8 +55,8 @@ def process_video(
             print("[VideoProcessor] Attempting cloud extraction v2 (Gemini 2.0 Flash)...")
             from cv.cloud_extractor_v2 import extract_frames_cloud_v2
             
-            # Use 2.0 fps for better accuracy capturing peak percentages
-            actual_fps = max(fps_sample, 2.0)  # 2 fps for better accuracy
+            # Use 3.0 fps for better accuracy capturing peak percentages
+            actual_fps = max(fps_sample, 3.0)  # 3 fps for better accuracy
             print(f"[VideoProcessor] Using fps_sample={actual_fps}")
             
             states = extract_frames_cloud_v2(

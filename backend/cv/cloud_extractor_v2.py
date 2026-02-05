@@ -27,7 +27,7 @@ except ImportError:
 
 def extract_frames_cloud_v2(
     video_path: str,
-    fps_sample: float = 2.0,  # 2 fps for better accuracy on peak percentages
+    fps_sample: float = 3.0,  # 3 fps for better accuracy on peak percentages
     progress_callback: Callable[[float], None] = None,
     max_duration: int = None,
     batch_size: int = 8,  # Frames per API call
@@ -40,6 +40,7 @@ def extract_frames_cloud_v2(
     - Send full frames (no complex cropping)
     - Smaller batches for better accuracy
     - Clear prompting for exact number reading
+    - High-resolution resampling around detected deaths for peak percentages
     """
     if not GEMINI_AVAILABLE:
         raise ImportError("google-generativeai required")
@@ -77,7 +78,7 @@ def extract_frames_cloud_v2(
                 all_states.extend(states)
                 
                 if progress_callback:
-                    progress_callback((batch_idx + 1) / len(batches) * 0.9)
+                    progress_callback((batch_idx + 1) / len(batches) * 0.8)
                 
                 print(f"[CloudExtractor v2] Batch {batch_idx + 1}/{len(batches)}: {len(states)} states")
             except Exception as e:
@@ -90,6 +91,12 @@ def extract_frames_cloud_v2(
     print("[CloudExtractor v2] Running validation pass...")
     validated = _validate_states(all_states)
     
+    # HIGH-RESOLUTION RESAMPLE around detected deaths
+    # The peak percentage before death only appears briefly (~0.1s)
+    # Standard 3fps misses it, so we resample at 10fps around death moments
+    print("[CloudExtractor v2] Resampling around deaths for peak percentages...")
+    validated = _resample_death_moments(video_path, validated, fps_sample)
+    
     if progress_callback:
         progress_callback(1.0)
     
@@ -98,8 +105,155 @@ def extract_frames_cloud_v2(
     return validated
 
 
+def _resample_death_moments(video_path: str, states: List[dict], base_fps: float) -> List[dict]:
+    """
+    Resample at higher fps around detected deaths to capture peak percentages.
+    
+    The peak percentage before death only appears for ~0.1-0.2 seconds during
+    hit effects. At 3fps sampling, we often miss this. This function:
+    1. Identifies death moments (percent drops from high to near 0)
+    2. Extracts 10fps samples in the 1 second before each death
+    3. Runs OCR on those frames to find the peak percentage
+    4. Updates states with better peak values
+    """
+    if not states:
+        return states
+    
+    # Find death moments - where percent drops from >50 to <15
+    death_moments = []
+    for i, state in enumerate(states):
+        if i < 1:
+            continue
+        
+        prev = states[i-1]
+        for player in ["p1", "p2"]:
+            pct_key = f"{player}_percent"
+            prev_pct = prev.get(pct_key) or 0
+            curr_pct = state.get(pct_key) or 0
+            
+            # Death = high percent to low percent
+            if prev_pct > 50 and curr_pct < 15:
+                death_moments.append({
+                    "timestamp": state["timestamp"],
+                    "player": player,
+                    "pre_death_pct": prev_pct,
+                    "state_idx": i
+                })
+    
+    if not death_moments:
+        return states
+    
+    print(f"[CloudExtractor v2] Found {len(death_moments)} death moments to resample")
+    
+    # Open video and extract high-res frames around each death
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return states
+    
+    video_fps = cap.get(cv2.CAP_PROP_FPS)
+    
+    # For each death, extract frames at 15fps in the 1.5 seconds before
+    # Higher fps = better chance of catching the brief peak frame
+    HIGH_RES_FPS = 15
+    LOOKBACK_SECS = 1.5
+    
+    for death in death_moments:
+        death_ts = death["timestamp"]
+        player = death["player"]
+        
+        # Calculate frame range
+        start_ts = max(0, death_ts - LOOKBACK_SECS)
+        end_ts = death_ts
+        
+        # Extract frames at 10fps in this window
+        high_res_frames = []
+        frame_interval = video_fps / HIGH_RES_FPS
+        
+        for t in np.arange(start_ts, end_ts, 1.0 / HIGH_RES_FPS):
+            frame_num = int(t * video_fps)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+            ret, frame = cap.read()
+            if ret:
+                # Resize and encode
+                h, w = frame.shape[:2]
+                if w > 1280:
+                    scale = 1280 / w
+                    frame = cv2.resize(frame, (1280, int(h * scale)))
+                
+                _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                high_res_frames.append((t, buffer.tobytes()))
+        
+        if len(high_res_frames) < 3:
+            continue
+        
+        # Process these frames with OCR
+        try:
+            high_res_states = _process_batch(high_res_frames, -1)
+            
+            # Find max percent for this player
+            pct_key = f"{player}_percent"
+            max_pct = death["pre_death_pct"]
+            
+            for hrs in high_res_states:
+                pct = hrs.get(pct_key)
+                if pct is not None and pct > max_pct and pct < 300:
+                    max_pct = pct
+            
+            # If we found a higher peak, update the state before death
+            if max_pct > death["pre_death_pct"]:
+                print(f"[CloudExtractor v2] Found higher {player} peak: {death['pre_death_pct']}% -> {max_pct}%")
+                # Update the state right before death with the peak
+                state_idx = death["state_idx"] - 1
+                if 0 <= state_idx < len(states):
+                    states[state_idx][pct_key] = max_pct
+            else:
+                # Apply damage estimation heuristic if we couldn't capture the peak
+                # The final hit that causes the kill typically adds 10-20% damage
+                # that only appears briefly before the percent resets
+                estimated_pct = _estimate_kill_percent(death["pre_death_pct"])
+                if estimated_pct > death["pre_death_pct"]:
+                    print(f"[CloudExtractor v2] Estimated {player} peak: {death['pre_death_pct']}% -> ~{estimated_pct}% (estimated)")
+                    state_idx = death["state_idx"] - 1
+                    if 0 <= state_idx < len(states):
+                        # Mark as estimated so coaching tips can note this
+                        states[state_idx][pct_key] = estimated_pct
+                        states[state_idx][f"{player}_percent_estimated"] = True
+        except Exception as e:
+            print(f"[CloudExtractor v2] High-res resample error: {e}")
+            continue
+    
+    cap.release()
+    return states
+
+
+def _estimate_kill_percent(last_stable_pct: float) -> float:
+    """
+    Estimate the actual kill percentage when we couldn't capture the peak frame.
+    
+    In Smash, the final hit that causes a KO typically adds 10-20% damage,
+    which only appears for ~0.1 seconds before the percent resets.
+    
+    This provides a more realistic estimate based on common kill scenarios:
+    - Kill moves at 120-140% often do 12-18% damage
+    - Kill moves at 140-160% may be weaker confirms doing 8-15%
+    - Very high percent kills (160+) may just be pokes doing 5-10%
+    """
+    if last_stable_pct < 100:
+        # Early kill - likely a strong kill move or combo
+        return last_stable_pct + 15
+    elif last_stable_pct < 130:
+        # Standard kill range - typical kill move
+        return last_stable_pct + 12
+    elif last_stable_pct < 150:
+        # Higher percent - could be weaker kill option
+        return last_stable_pct + 10
+    else:
+        # Very high percent - likely just a poke
+        return last_stable_pct + 8
+
+
 def _extract_frames(video_path: str, fps_sample: float, max_duration: Optional[int]) -> List[tuple]:
-    """Extract frames from video."""
+    """Extract frames from video with high-FPS sampling for final seconds."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise ValueError(f"Could not open video: {video_path}")
@@ -114,6 +268,13 @@ def _extract_frames(video_path: str, fps_sample: float, max_duration: Optional[i
     
     frame_interval = int(video_fps / fps_sample) if fps_sample < video_fps else 1
     
+    # Calculate when to switch to high-FPS mode for final seconds
+    # Use 10 seconds to account for post-game screens that pad the video
+    HIGH_FPS_FINAL_SECONDS = 10.0
+    HIGH_FPS_RATE = 8  # 8 fps for final seconds (balance between coverage and API cost)
+    high_fps_start_time = max(0, duration - HIGH_FPS_FINAL_SECONDS)
+    high_fps_interval = int(video_fps / HIGH_FPS_RATE) if HIGH_FPS_RATE < video_fps else 1
+    
     frames = []
     frame_num = 0
     
@@ -122,7 +283,15 @@ def _extract_frames(video_path: str, fps_sample: float, max_duration: Optional[i
         if not ret:
             break
         
-        if frame_num % frame_interval == 0:
+        current_time = frame_num / video_fps
+        
+        # Use high FPS for final 3 seconds, normal FPS otherwise
+        if current_time >= high_fps_start_time:
+            should_sample = (frame_num % high_fps_interval == 0)
+        else:
+            should_sample = (frame_num % frame_interval == 0)
+        
+        if should_sample:
             timestamp = frame_num / video_fps
             
             # Skip very dark frames
@@ -155,34 +324,45 @@ def _process_batch(frames: List[tuple], batch_idx: int, max_retries: int = 3) ->
 
 YOUR TASK: Extract the EXACT damage percentages and stock counts shown on screen.
 
-WHAT TO LOOK FOR:
-- Damage percentages are large colored numbers (red/orange/yellow) at the BOTTOM of the screen
-- Player 1 (P1) HUD is on the LEFT side, Player 2 (P2) HUD is on the RIGHT side
-- Stock icons are small character portrait icons below/near the damage percent
-- Count the stock icons carefully: 0, 1, 2, or 3
+DAMAGE PERCENTAGE READING - CRITICAL:
+- Damage percentages are LARGE COLORED NUMBERS at the BOTTOM of the screen
+- The numbers use a stylized font - read EACH DIGIT carefully
+- Common values range from 0% to 200%+ (high percent = close to death)
+- Player 1 (P1) percentage is on the LEFT side
+- Player 2 (P2) percentage is on the RIGHT side
+- The "%" symbol appears after the number
 
-DETECTING "GAME!" END SCREENS:
-- "GAME!" appears in large text when the match ENDS
-- On GAME! screens, one player ALWAYS has 0 stocks (they lost)
-- The other player has 1, 2, or 3 stocks (they won)
-- Look carefully at where stock icons SHOULD be - if a player's stock area is EMPTY, they have 0 stocks
-- The losing player's stock icons will be GONE or show 0
+DIGIT READING TIPS (the font can be tricky):
+- "1" looks like a thin vertical line, often with a small base
+- "4" has a horizontal bar crossing a vertical line (like an upside-down 'h')
+- "6" has a curved bottom loop (like a rotated 'g' shape) - DO NOT confuse with "4"
+- "0" is a full oval/circle shape
+- "3" has two curved bumps on the right
+- "2" has a curved top and flat bottom with diagonal connector
+- Watch for 3-digit numbers: 100%, 120%, 145%, 162%, etc.
+- CRITICAL: If damage is high, expect 3 digits! Values like 140%, 145%, 160%, 162% are common before deaths
+- When in doubt between "4" and "6", look for the curved loop at bottom (6) vs straight lines (4)
 
-CRITICAL - STOCK READING:
-- Stock icons are small character face portraits
-- If you see NO portraits in a player's stock area = 0 stocks
-- If portraits are greyed out or have an X = those stocks are lost
-- One player MUST have 0 stocks when "GAME!" appears
+STOCK ICONS:
+- Stock icons are small character face portraits below/near the damage percent
+- P1 stocks are on the LEFT, P2 stocks are on the RIGHT
+- Count carefully: 0, 1, 2, or 3 stock icons visible
+- Empty/missing stock area = 0 stocks
+
+GAME END DETECTION:
+- "GAME!" text appears when the match ENDS
+- On GAME! screens, the LOSER has 0 stocks, WINNER has 1-3 stocks
+- game_active = false when you see "GAME!", "GO!", or "READY" text
 
 RULES:
-1. READ exact numbers shown - do NOT guess
-2. Stock counts: 0, 1, 2, or 3 (0 is VALID and CRITICAL for game end)
-3. game_active = false when you see "GAME!", "GO!", or "READY" text
+1. READ the exact digits shown - do NOT estimate or round
+2. Double-check 3-digit percentages (100%+) - these are common before deaths
+3. Stock counts: 0, 1, 2, or 3 only
 
 Return ONLY a JSON array:
 [
   {"timestamp": 0.0, "p1_percent": 0, "p2_percent": 0, "p1_stocks": 3, "p2_stocks": 3, "game_active": true},
-  {"timestamp": 210.0, "p1_percent": null, "p2_percent": null, "p1_stocks": 0, "p2_stocks": 1, "game_active": false}
+  {"timestamp": 210.0, "p1_percent": 162, "p2_percent": 145, "p1_stocks": 1, "p2_stocks": 0, "game_active": false}
 ]
 
 Here are the frames to analyze:
@@ -280,7 +460,14 @@ def _parse_stocks(value) -> Optional[int]:
 
 
 def _validate_states(states: List[dict]) -> List[dict]:
-    """Validate and fix extracted states."""
+    """
+    Validate and fix extracted states.
+    
+    CRITICAL: OCR stock counts are UNRELIABLE. We use percent resets
+    as the primary signal for stock losses:
+    - Death = percent drops from >50% to <15%
+    - We IGNORE OCR stock values and track stocks based on deaths
+    """
     if not states:
         return []
     
@@ -295,40 +482,78 @@ def _validate_states(states: List[dict]) -> List[dict]:
     validated = []
     last_p1 = 0
     last_p2 = 0
-    last_p1_stocks = 3
-    last_p2_stocks = 3
+    # Track stocks OURSELVES based on percent resets (ignore OCR)
+    tracked_p1_stocks = 3
+    tracked_p2_stocks = 3
     max_p1 = 0
     max_p2 = 0
     game_ended = False
     
+    # Respawn cooldown: after death, ignore OCR errors for this many seconds
+    RESPAWN_COOLDOWN = 10.0  # seconds (increased for safety)
+    p1_death_time = None
+    p2_death_time = None
+    
     for state in states[start_idx:]:
-        # CRITICAL: Always keep frames where someone has 0 stocks (game end)
-        raw_p1_stocks = state.get("p1_stocks")
-        raw_p2_stocks = state.get("p2_stocks")
-        is_game_ending_frame = (raw_p1_stocks == 0 or raw_p2_stocks == 0)
-        
-        # Skip pre-game frames, but KEEP end-game frames (game_active=false after game started)
+        # Skip pre-game frames
         if not state.get("game_active", True):
-            if game_ended and not is_game_ending_frame:
-                # Already processed end-game, skip further frames (but always keep 0-stock frames)
-                continue
-            elif is_game_ending_frame or last_p1_stocks > 0 or last_p2_stocks > 0:
-                # This is an end-game frame (GAME! screen) - process it for stock counts
-                game_ended = True
-                # Fall through to process this frame
-            else:
-                continue
+            continue
         
+        timestamp = state.get("timestamp", 0)
         p1 = state.get("p1_percent")
         p2 = state.get("p2_percent")
-        p1_stocks = state.get("p1_stocks")
-        p2_stocks = state.get("p2_stocks")
+        raw_p1_stocks = state.get("p1_stocks")
+        raw_p2_stocks = state.get("p2_stocks")
         
-        # Track max percents
+        if game_ended:
+            continue
+        
+        # During respawn cooldown, be VERY careful about OCR readings
+        # Only accept percent values that make sense (low during respawn)
+        if p1_death_time is not None and timestamp - p1_death_time < RESPAWN_COOLDOWN:
+            # P1 is respawning - reject high percent readings (OCR errors)
+            if p1 is not None and p1 > 30:
+                p1 = last_p1  # Keep last known value (should be low)
+        
+        if p2_death_time is not None and timestamp - p2_death_time < RESPAWN_COOLDOWN:
+            # P2 is respawning - reject high percent readings (OCR errors)
+            if p2 is not None and p2 > 30:
+                p2 = last_p2  # Keep last known value (should be low)
+        
+        # Track max percents for each stock
         if p1 is not None and p1 > max_p1:
             max_p1 = p1
         if p2 is not None and p2 > max_p2:
             max_p2 = p2
+        
+        # STOCK TRACKING: Detect deaths from percent resets ONLY
+        # Death = percent drops from high (>50%) to low (<15%)
+        # CRITICAL: Only count ONE death per reset
+        if p1 is not None and last_p1 > 50 and p1 < 15:
+            # P1 died - decrement stock
+            tracked_p1_stocks -= 1
+            max_p1 = 0  # Reset max for next stock
+            last_p1 = p1  # UPDATE IMMEDIATELY to prevent double-counting
+            p1_death_time = timestamp  # Start respawn cooldown
+            if tracked_p1_stocks <= 0:
+                tracked_p1_stocks = 0
+                # DON'T immediately end game - wait for "new game" signal
+        
+        if p2 is not None and last_p2 > 50 and p2 < 15:
+            # P2 died - decrement stock
+            tracked_p2_stocks -= 1
+            max_p2 = 0  # Reset max for next stock
+            last_p2 = p2  # UPDATE IMMEDIATELY to prevent double-counting
+            p2_death_time = timestamp  # Start respawn cooldown
+            if tracked_p2_stocks <= 0:
+                tracked_p2_stocks = 0
+        
+        # End game when someone has 0 stocks (after a brief delay for GAME! screen)
+        if tracked_p1_stocks == 0 or tracked_p2_stocks == 0:
+            # Check if we're a few seconds past the final death
+            final_death_time = p1_death_time if tracked_p1_stocks == 0 else p2_death_time
+            if final_death_time and timestamp - final_death_time > 3.0:
+                game_ended = True
         
         # Validate P1 percent
         if p1 is not None:
@@ -350,30 +575,18 @@ def _validate_states(states: List[dict]) -> List[dict]:
             elif last_p2 > 0 and p2 > last_p2 + 80:
                 p2 = None
         
-        # Validate stocks (don't allow increase, but DO allow decrease to 0)
-        if p1_stocks is not None:
-            if p1_stocks > last_p1_stocks:
-                p1_stocks = last_p1_stocks  # Can't gain stocks
-            # Allow decrease to any value (including 0) - stock can drop 2 at once in rare cases
-        
-        if p2_stocks is not None:
-            if p2_stocks > last_p2_stocks:
-                p2_stocks = last_p2_stocks  # Can't gain stocks
-            # Allow decrease to any value (including 0)
+        # IGNORE OCR stock values entirely - use our tracked stocks
+        # (OCR is too unreliable for stock counts)
         
         state["p1_percent"] = p1
         state["p2_percent"] = p2
-        state["p1_stocks"] = p1_stocks
-        state["p2_stocks"] = p2_stocks
+        state["p1_stocks"] = tracked_p1_stocks
+        state["p2_stocks"] = tracked_p2_stocks
         
         if p1 is not None:
             last_p1 = p1
         if p2 is not None:
             last_p2 = p2
-        if p1_stocks is not None:
-            last_p1_stocks = p1_stocks
-        if p2_stocks is not None:
-            last_p2_stocks = p2_stocks
         
         validated.append(state)
     
@@ -382,7 +595,7 @@ def _validate_states(states: List[dict]) -> List[dict]:
 
 def process_video(
     video_path: str,
-    fps_sample: float = 2.0,  # 2 fps for better accuracy
+    fps_sample: float = 3.0,  # 3 fps for better accuracy
     progress_callback: Callable[[float], None] = None,
     max_duration: int = None
 ) -> List[dict]:

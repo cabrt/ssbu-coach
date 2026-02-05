@@ -1,11 +1,18 @@
 import os
 import sys
+import json
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from analysis.patterns import find_patterns
 from analysis.characters import get_character_tips, get_matchup_advice, get_character_specific_feedback, get_character_info
+
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
 
 def _fmt_pct(value) -> str:
     """Format a percentage value to one decimal place (e.g., 13.8%)."""
@@ -31,6 +38,328 @@ def _filter_impossible_tips(tips: list) -> list:
             continue
         filtered.append(t)
     return filtered
+
+
+def _nearest_state(states: list, timestamp: float) -> dict:
+    """Find the game state closest to the given timestamp."""
+    if not states:
+        return None
+    return min(states, key=lambda s: abs(s.get("timestamp", 0) - timestamp))
+
+
+def _get_opponent_move_hints(opponent_char: str, category: str = "kill") -> list:
+    """Return a small list of opponent move names to respect."""
+    o_data = get_character_info(opponent_char)
+    if not o_data:
+        return []
+    moves = o_data.get("key_moves", {}).get(category, [])
+    return [m for m in moves if m][:2]
+
+
+def _get_player_move_hints(player_char: str, category: str = "neutral") -> list:
+    """Return a small list of your character moves to consider."""
+    p_data = get_character_info(player_char)
+    if not p_data:
+        return []
+    moves = p_data.get("key_moves", {}).get(category, [])
+    return [m for m in moves if m][:2]
+
+
+def _get_opponent_escape_options(opponent_char: str, kill_percent: float) -> str:
+    """
+    Return opponent's likely escape options based on character and percent.
+    This helps the player anticipate defensive reactions and cover them.
+    """
+    # Universal escape options everyone has
+    universal_options = []
+    
+    if kill_percent >= 100:
+        # At high percent, opponents are more desperate
+        universal_options = ["airdodge", "DI away", "jump out"]
+    elif kill_percent >= 60:
+        # Mid percent - more variety
+        universal_options = ["DI mixups", "airdodge", "double jump"]
+    else:
+        # Low percent - combo escapes
+        universal_options = ["SDI", "airdodge", "jump"]
+    
+    # Character-specific escape options - comprehensive list
+    char_options = []
+    if opponent_char:
+        opp_lower = opponent_char.lower()
+        # Characters with special escape tools
+        escape_tools = {
+            # Swordfighters
+            "marth": ["counter", "dolphin slash"],
+            "lucina": ["counter", "dolphin slash"],
+            "roy": ["counter", "blazer"],
+            "chrom": ["counter", "soaring slash"],
+            "ike": ["counter", "aether armor"],
+            "cloud": ["limit up-b", "limit side-b"],
+            "sephiroth": ["wing recovery", "counter"],
+            "shulk": ["vision counter", "monado jump"],
+            "corrin": ["counter surge", "dragon lunge"],
+            "byleth": ["up-b tether", "down-b armor"],
+            "pyra": ["prominence revolt"],
+            "mythra": ["photon edge", "foresight"],
+            "meta knight": ["dimensional cape", "mach tornado"],
+            "link": ["bomb recovery", "up-b spin"],
+            "young link": ["bomb recovery", "up-b spin"],
+            "toon link": ["bomb recovery", "up-b spin"],
+            "hero": ["zoom recovery", "bounce"],
+            "robin": ["elwind recovery"],
+            "mii swordfighter": ["tornado slash", "stone scabbard"],
+            
+            # Heavyweights
+            "bowser": ["tough guy armor", "up-b out of shield"],
+            "ganondorf": ["wizard's foot", "up-b recovery"],
+            "king dedede": ["multiple jumps", "gordo"],
+            "k rool": ["belly armor", "propeller recovery"],
+            "donkey kong": ["cargo throw mixup", "spinning kong"],
+            "king k. rool": ["belly armor", "propeller recovery"],
+            "incineroar": ["revenge", "cross chop"],
+            "ridley": ["multiple jumps", "space pirate rush"],
+            "charizard": ["rock smash armor", "fly"],
+            
+            # Projectile/Zoners
+            "samus": ["bomb recovery", "charge shot"],
+            "dark samus": ["bomb recovery", "charge shot"],
+            "snake": ["C4 recovery", "cypher"],
+            "mega man": ["rush coil", "leaf shield"],
+            "pac-man": ["trampoline recovery", "hydrant"],
+            "villager": ["lloid rocket recovery", "timber"],
+            "isabelle": ["lloid recovery", "fishing rod"],
+            "duck hunt": ["can recovery", "clay pigeon"],
+            "rob": ["gyro toss", "robo burner"],
+            "olimar": ["pikmin tether", "whistle super armor"],
+            "min min": ["ARMS jump", "up-b tether"],
+            "mii gunner": ["arm rocket", "grenade"],
+            
+            # Fast/Combo Characters
+            "fox": ["shine stall", "firefox"],
+            "falco": ["shine stall", "firebird"],
+            "wolf": ["shine", "wolf flash"],
+            "pikachu": ["quick attack escape"],
+            "pichu": ["agility escape"],
+            "captain falcon": ["raptor boost", "falcon dive"],
+            "sonic": ["spin dash escape", "spring"],
+            "sheik": ["vanish mixup", "bouncing fish"],
+            "zero suit samus": ["flip kick", "boost kick"],
+            "greninja": ["shadow sneak", "hydro pump"],
+            "joker": ["grappling hook", "rebel's guard"],
+            "kazuya": ["devil fist", "devil wings"],
+            
+            # Floaties/Aerials
+            "peach": ["float cancel", "parasol"],
+            "daisy": ["float cancel", "parasol"],
+            "jigglypuff": ["multiple jumps", "pound"],
+            "kirby": ["multiple jumps", "final cutter"],
+            "dedede": ["multiple jumps", "super dedede jump"],
+            "game & watch": ["bucket", "fire escape"],
+            "mr. game & watch": ["bucket", "fire escape"],
+            
+            # Grapplers
+            "incineroar": ["revenge", "cross chop"],
+            "bowser": ["tough guy", "command grab"],
+            "donkey kong": ["cargo mixup", "headbutt bury"],
+            
+            # Unique Movement
+            "zelda": ["teleport mixup", "phantom"],
+            "palutena": ["teleport mixup", "counter/reflect"],
+            "mewtwo": ["teleport mixup", "disable"],
+            "wario": ["waft", "bike escape"],
+            "diddy": ["barrel escape", "banana"],
+            "bayonetta": ["witch twist", "bat within"],
+            "inkling": ["roller escape", "splat bomb"],
+            "steve": ["minecart escape", "block recovery"],
+            "kazuya": ["devil wings", "electric moves"],
+            "terry": ["power dunk", "buster wolf"],
+            "ryu": ["focus attack", "shoryuken"],
+            "ken": ["focus attack", "shoryuken"],
+            "little mac": ["slip counter", "jolt haymaker"],
+            "mii brawler": ["suplex", "soaring axe kick"],
+            
+            # Others
+            "ness": ["PK thunder recovery", "PSI magnet"],
+            "lucas": ["PK thunder recovery", "PSI magnet"],
+            "yoshi": ["double jump armor", "egg toss"],
+            "wii fit trainer": ["deep breathing", "header"],
+            "pit": ["multiple jumps", "guardian orbitars"],
+            "dark pit": ["multiple jumps", "guardian orbitars"],
+            "rosalina": ["luma recall", "gravitational pull"],
+            "ice climbers": ["belay", "blizzard"],
+            "pokemon trainer": ["pokemon change invincibility"],
+            "squirtle": ["withdraw", "waterfall"],
+            "ivysaur": ["tether recovery", "razor leaf"],
+            "piranha plant": ["ptooie", "long stem strike"],
+            "banjo": ["wonderwing armor", "shock spring"],
+            "sora": ["aerial dodge", "sonic blade"],
+            "minecraft steve": ["minecart", "block placement"],
+        }
+        char_options = escape_tools.get(opp_lower, [])
+    
+    # Combine options
+    all_options = universal_options + char_options[:2]
+    if all_options:
+        return "Watch for opponent's escape options: " + ", ".join(all_options[:4]) + ". Cover their most likely option to secure follow-ups."
+    return ""
+
+
+def _add_specificity_to_tips(
+    tips: list,
+    patterns: dict,
+    states: list,
+    player_char: str = None,
+    opponent_char: str = None
+) -> list:
+    """Make tips more specific using rule-based context and matchup hints."""
+    if not tips:
+        return tips
+
+    damage_dealt_times = [d.get("timestamp") for d in patterns.get("damage_dealt", []) if d.get("timestamp") is not None]
+
+    def _recent_damage_dealt(ts: float, window: float = 2.0) -> bool:
+        return any(abs(ts - t) <= window for t in damage_dealt_times)
+
+    for tip in tips:
+        tip_type = tip.get("type")
+        ts = tip.get("timestamp", 0)
+        state = _nearest_state(states, ts)
+        your_pct = state.get("p1_percent") if state else None
+        opp_pct = state.get("p2_percent") if state else None
+
+        context_hint = None
+
+        if tip_type == "damage_taken":
+            damage = tip.get("damage", 0)
+            from_pct = tip.get("from_percent", 0)
+            to_pct = tip.get("to_percent", from_pct + damage)
+
+            base = f"Took {_fmt_pct(damage)} damage quickly ({_fmt_pct(from_pct)} → {_fmt_pct(to_pct)})."
+
+            if _recent_damage_dealt(ts, window=2.0):
+                context_hint = "overextension_reversal"
+                detail = "This looks like a quick reversal after your hit—reset spacing or shield after advantage to avoid an immediate punish."
+            elif (to_pct if isinstance(to_pct, (int, float)) else 0) >= 100:
+                context_hint = "high_percent_defense"
+                detail = "At high percent, prioritize safe landings and avoid drifting into burst range."
+            elif (from_pct if isinstance(from_pct, (int, float)) else 0) <= 30:
+                context_hint = "early_opening"
+                detail = "At low percent, avoid autopilot approaches; use safer pokes and space just outside their range."
+            else:
+                context_hint = "mid_percent_defense"
+                detail = "Mix defensive options (drift, fast-fall timing, shield) to avoid taking the follow-up."
+
+            opp_kill_moves = _get_opponent_move_hints(opponent_char, "kill")
+            if opp_kill_moves and (to_pct if isinstance(to_pct, (int, float)) else 0) >= 90:
+                detail += f" Respect kill options like {', '.join(opp_kill_moves)}."
+
+            tip["message"] = f"{base} {detail}"
+
+        elif tip_type == "stock_lost":
+            percent = tip.get("percent", 0)
+            stocks_left = tip.get("stocks_remaining", "?")
+            base = f"Lost a stock at {_fmt_pct(percent)}. ({stocks_left} stocks remaining)"
+
+            pct_val = percent if isinstance(percent, (int, float)) else 0
+            if pct_val < 60:
+                context_hint = "early_stock_loss"
+                detail = "Early stock—likely off a setup or edgeguard. Mix your recovery timing and avoid predictable landings."
+            elif pct_val < 100:
+                context_hint = "mid_stock_loss"
+                detail = "Mid-percent loss—review your defensive choice and DI in that exchange."
+            elif pct_val < 150:
+                context_hint = "standard_stock_loss"
+                detail = "Standard kill percent—prioritize DI mixups and safer landings."
+            else:
+                context_hint = "late_stock_loss"
+                detail = "Late stock—good survival, but avoid corner pressure and watch for kill options."
+
+            opp_kill_moves = _get_opponent_move_hints(opponent_char, "kill")
+            if opp_kill_moves and pct_val >= 90:
+                detail += f" Against {opponent_char}, watch for {', '.join(opp_kill_moves)} at high percent."
+
+            tip["message"] = f"{base} {detail}"
+
+        elif tip_type == "stock_taken":
+            percent = tip.get("opponent_percent", tip.get("percent", 0))
+            opp_stocks_left = tip.get("opponent_stocks_remaining", "?")
+            pct_val = percent if isinstance(percent, (int, float)) else 0
+
+            if pct_val < 60:
+                kill_type = "Early kill! Great punish"
+                context_hint = "early_kill"
+                detail = "Great closeout—look for the same confirm or edgeguard setup in similar spots."
+            elif pct_val < 100:
+                kill_type = "Solid kill"
+                context_hint = "solid_kill"
+                detail = "Solid punish—keep stage control and set up your next advantage."
+            elif pct_val < 130:
+                kill_type = "Nice KO"
+                context_hint = "mid_kill"
+                detail = "Clean closeout—focus on consistent kill setups at this percent."
+            else:
+                kill_type = "Got the KO"
+                context_hint = "late_kill"
+                detail = "High-percent KO—good patience; keep them cornered to avoid reversals."
+            
+            # Add opponent escape options to help player read/anticipate defensive options
+            escape_options = _get_opponent_escape_options(opponent_char, pct_val)
+            if escape_options:
+                detail += f" Tip*: {escape_options}"
+
+            tip["message"] = f"{kill_type}! Took opponent's stock at {_fmt_pct(percent)}. (Opponent has {opp_stocks_left} stocks left) {detail}"
+
+        elif tip_type == "damage_dealt":
+            damage = tip.get("damage", 0)
+            from_pct = tip.get("from_percent", 0)
+            to_pct = tip.get("to_percent", from_pct + damage)
+            base = f"Nice! Dealt {_fmt_pct(damage)} damage ({_fmt_pct(from_pct)} → {_fmt_pct(to_pct)})."
+            context_hint = "damage_dealt"
+            player_moves = _get_player_move_hints(player_char, "neutral")
+            move_hint = f" Consider pokes like {', '.join(player_moves)} to keep pressure safe." if player_moves else " Keep pressure by tracking their defensive habits (shield/roll/jump)."
+            tip["message"] = f"{base}{move_hint}"
+
+        elif tip_type == "combo":
+            from_pct = tip.get("from_percent", 0)
+            to_pct = tip.get("to_percent", from_pct + tip.get("damage", 0))
+            damage = tip.get("damage", 0)
+            context_hint = "combo_extension"
+            tip["message"] = f"Nice combo dealing {_fmt_pct(damage)} damage ({_fmt_pct(from_pct)} → {_fmt_pct(to_pct)}). Track DI and be ready to catch their landing with safe follow-ups."
+
+        elif tip_type == "neutral":
+            context_hint = "neutral_stall"
+            tip["message"] = f"Extended neutral ({tip.get('duration', 0):.0f}s). Use safe pokes and movement to force a reaction instead of overcommitting."
+
+        elif tip_type == "edgeguard":
+            context_hint = "edgeguard_success"
+            your_dmg = tip.get("your_damage_taken", 0)
+            player_moves = _get_player_move_hints(player_char, "edgeguard") or _get_player_move_hints(player_char, "kill")
+            move_hint = f" Consider using {', '.join(player_moves)} for safe edgeguards." if player_moves else ""
+            tip["message"] = (f"Great edgeguard! You secured the kill while only taking {_fmt_pct(your_dmg)} damage. "
+                             f"{'Keep using this low-risk approach!' if your_dmg < 5 else 'Watch for counter-attacks when going deep.'}"
+                             f"{move_hint}")
+
+        elif tip_type == "momentum_advantage":
+            context_hint = "momentum_positive"
+            player_moves = _get_player_move_hints(player_char, "combo_starters")
+            move_hint = f" Look for openings with {', '.join(player_moves)}." if player_moves else ""
+            tip["message"] = (f"Good exchange! Dealt {_fmt_pct(tip.get('damage_dealt', 0))} while only taking {_fmt_pct(tip.get('damage_taken', 0))}. "
+                             f"Capitalize by maintaining stage control and pressuring their landing.{move_hint}")
+
+        elif tip_type == "momentum_disadvantage":
+            context_hint = "momentum_negative"
+            opp_moves = _get_opponent_move_hints(opponent_char, "neutral")
+            move_hint = f" Watch for {', '.join(opp_moves)}." if opp_moves else ""
+            tip["message"] = (f"Took {_fmt_pct(tip.get('damage_taken', 0))} in a bad exchange. "
+                             f"Reset neutral with movement or a safe option.{move_hint}")
+
+        if context_hint:
+            tip["context_hint"] = context_hint
+            tip["your_percent"] = your_pct
+            tip["opponent_percent"] = opp_pct
+
+    return tips
 
 
 def _swap_game_states(game_states: list) -> list:
@@ -86,7 +415,10 @@ def generate_coaching(game_states: list, player_char: str = None, opponent_char:
                 "timestamp": spike["timestamp"],
                 "type": "damage_taken",
                 "severity": "high" if damage > 50 else "medium",
-                "message": f"Took {_fmt_pct(damage)} damage quickly ({_fmt_pct(from_pct)} → {_fmt_pct(to_pct)}). Review what option you chose here."
+                "message": f"Took {_fmt_pct(damage)} damage quickly ({_fmt_pct(from_pct)} → {_fmt_pct(to_pct)}).",
+                "from_percent": from_pct,
+                "to_percent": to_pct,
+                "damage": damage,
             })
     
     if patterns.get("long_neutral"):
@@ -95,7 +427,8 @@ def generate_coaching(game_states: list, player_char: str = None, opponent_char:
                 "timestamp": neutral["start"],
                 "type": "neutral",
                 "severity": "low",
-                "message": f"Extended neutral ({neutral['duration']:.0f}s). Look for ways to force an approach or create openings."
+                "message": f"Extended neutral ({neutral['duration']:.0f}s). Look for ways to force an approach or create openings.",
+                "duration": neutral.get("duration", 0),
             })
     
     if patterns.get("stock_losses"):
@@ -106,7 +439,9 @@ def generate_coaching(game_states: list, player_char: str = None, opponent_char:
                 "timestamp": loss["timestamp"],
                 "type": "stock_lost",
                 "severity": "high",
-                "message": f"Lost a stock at {_fmt_pct(percent)}. ({stocks_left} stocks remaining) " + get_stock_loss_advice(percent)
+                "message": f"Lost a stock at {_fmt_pct(percent)}. ({stocks_left} stocks remaining) " + get_stock_loss_advice(percent),
+                "percent": percent,
+                "stocks_remaining": stocks_left,
             })
     
     if patterns.get("combos"):
@@ -118,7 +453,10 @@ def generate_coaching(game_states: list, player_char: str = None, opponent_char:
                 "timestamp": combo["start"],
                 "type": "combo",
                 "severity": "positive",
-                "message": f"Nice combo dealing {_fmt_pct(damage)} damage ({_fmt_pct(from_pct)} → {_fmt_pct(to_pct)})!"
+                "message": f"Nice combo dealing {_fmt_pct(damage)} damage ({_fmt_pct(from_pct)} → {_fmt_pct(to_pct)})!",
+                "from_percent": from_pct,
+                "to_percent": to_pct,
+                "damage": damage,
             })
     
     if patterns.get("kills"):
@@ -139,7 +477,9 @@ def generate_coaching(game_states: list, player_char: str = None, opponent_char:
                 "timestamp": kill["timestamp"],
                 "type": "stock_taken",
                 "severity": "positive",
-                "message": f"{kill_type}! Took opponent's stock at {_fmt_pct(percent)}. (Opponent has {opp_stocks_left} stocks left)"
+                "message": f"{kill_type}! Took opponent's stock at {_fmt_pct(percent)}. (Opponent has {opp_stocks_left} stocks left)",
+                "opponent_percent": percent,
+                "opponent_stocks_remaining": opp_stocks_left,
             })
     
     if patterns.get("damage_dealt"):
@@ -152,8 +492,70 @@ def generate_coaching(game_states: list, player_char: str = None, opponent_char:
                 "timestamp": dealt["timestamp"],
                 "type": "damage_dealt",
                 "severity": "positive",
-                "message": f"Nice! Dealt {_fmt_pct(damage)} damage ({_fmt_pct(from_pct)} → {_fmt_pct(to_pct)})."
+                "message": f"Nice! Dealt {_fmt_pct(damage)} damage ({_fmt_pct(from_pct)} → {_fmt_pct(to_pct)}).",
+                "from_percent": from_pct,
+                "to_percent": to_pct,
+                "damage": damage,
             })
+    
+    # EDGEGUARD TIPS - recognize successful offstage plays
+    if patterns.get("edgeguards"):
+        for eg in patterns["edgeguards"][:5]:
+            likely = eg.get("is_likely_edgeguard", False)
+            your_dmg = eg.get("your_damage_taken", 0)
+            tips.append({
+                "timestamp": eg["timestamp"],
+                "type": "edgeguard",
+                "severity": "positive",
+                "message": f"Great edgeguard! You secured the kill while only taking {_fmt_pct(your_dmg)} damage. "
+                          f"{'Low-risk edgeguard - keep using this approach!' if likely else 'Watch for trades when going deep offstage.'}",
+                "your_damage_taken": your_dmg,
+                "opponent_percent": eg.get("opponent_percent", 0),
+            })
+    
+    # GOT EDGEGUARDED TIPS - learn from opponent's successful edgeguards
+    if patterns.get("got_edgeguarded"):
+        for eg in patterns["got_edgeguarded"][:3]:
+            death_pct = eg.get("your_death_percent", 0)
+            opp_dmg = eg.get("opponent_damage_taken", 0)
+            tips.append({
+                "timestamp": eg["timestamp"],
+                "type": "got_edgeguarded",
+                "severity": "high",
+                "message": f"Got edgeguarded at {_fmt_pct(death_pct)}. "
+                          f"{'Opponent took 0 damage - they read your recovery option. ' if opp_dmg < 5 else ''}"
+                          f"Mix up recovery timing, angle, and use of double jump/up-B to make yourself harder to edgeguard.",
+                "your_death_percent": death_pct,
+                "opponent_damage_taken": opp_dmg,
+            })
+    
+    # MOMENTUM SWING TIPS - help players understand match flow
+    if patterns.get("momentum_swings"):
+        advantage_count = sum(1 for m in patterns["momentum_swings"] if m.get("type") == "advantage")
+        disadvantage_count = sum(1 for m in patterns["momentum_swings"] if m.get("type") == "disadvantage")
+        
+        # Only add tips for significant momentum swings (up to 3)
+        for swing in patterns["momentum_swings"][:3]:
+            if swing.get("type") == "advantage":
+                tips.append({
+                    "timestamp": swing["timestamp"],
+                    "type": "momentum_advantage",
+                    "severity": "positive",
+                    "message": f"Good exchange! Dealt {_fmt_pct(swing.get('damage_dealt', 0))} while only taking {_fmt_pct(swing.get('damage_taken', 0))}. "
+                              f"Capitalize on advantage by maintaining stage control.",
+                    "damage_dealt": swing.get("damage_dealt", 0),
+                    "damage_taken": swing.get("damage_taken", 0),
+                })
+            elif swing.get("type") == "disadvantage":
+                tips.append({
+                    "timestamp": swing["timestamp"],
+                    "type": "momentum_disadvantage",
+                    "severity": "medium",
+                    "message": f"Took {_fmt_pct(swing.get('damage_taken', 0))} damage in a bad exchange. "
+                              f"Look to reset neutral with movement or a safe option instead of engaging directly.",
+                    "damage_dealt": swing.get("damage_dealt", 0),
+                    "damage_taken": swing.get("damage_taken", 0),
+                })
     
     # add character-specific tips
     char_tips = get_character_specific_feedback(player_char, opponent_char, patterns)
@@ -164,6 +566,9 @@ def generate_coaching(game_states: list, player_char: str = None, opponent_char:
     
     # drop tips with impossible game-state (OCR errors: 188% damage, stock lost at 188%, etc.)
     tips = _filter_impossible_tips(tips)
+
+    # add rule-based specificity and matchup context
+    tips = _add_specificity_to_tips(tips, patterns, states_to_analyze, player_char, opponent_char)
     
     # generate AI summary and enhance tips with factual advice only
     summary, enhanced_tips = generate_ai_coaching(raw_stats, patterns, tips, player_char, opponent_char)
@@ -298,10 +703,62 @@ def calculate_stats(game_states: list) -> dict:
             winner = "p1"
             print(f"[Winner] P1 lost {p1_stock_losses} stocks, P2 lost {p2_stock_losses} -> P1 wins")
     
-    # Method 4: If game ended (game_active=false) and stocks still tied, 
-    # use last known percent - higher percent player likely got KO'd
+    # Method 4: Count percent resets (deaths) throughout the game FIRST
+    # This is more reliable than percent heuristics
     if winner == "unknown":
-        # Find the last frame before game_active became false
+        p1_deaths = 0
+        p2_deaths = 0
+        
+        for i in range(1, len(game_states)):
+            prev = game_states[i-1]
+            curr = game_states[i]
+            
+            p1_prev_pct = prev.get("p1_percent") or 0
+            p1_curr_pct = curr.get("p1_percent") or 0
+            p2_prev_pct = prev.get("p2_percent") or 0
+            p2_curr_pct = curr.get("p2_percent") or 0
+            
+            # Detect percent resets (high -> low)
+            if p1_prev_pct >= 50 and p1_curr_pct < 15:
+                p1_deaths += 1
+            if p2_prev_pct >= 50 and p2_curr_pct < 15:
+                p2_deaths += 1
+        
+        if p1_deaths > p2_deaths:
+            winner = "p2"  # P1 died more = P2 wins
+            print(f"[Winner] Death count: P1={p1_deaths}, P2={p2_deaths} -> P2 wins")
+        elif p2_deaths > p1_deaths:
+            winner = "p1"  # P2 died more = P1 wins
+            print(f"[Winner] Death count: P1={p1_deaths}, P2={p2_deaths} -> P1 wins")
+        else:
+            # Deaths are tied - likely missed the final death
+            print(f"[Winner] Death count tied: P1={p1_deaths}, P2={p2_deaths} - checking other methods")
+    
+    # Method 5: Check for sudden percent drop in final frames (indicates a kill happened)
+    if winner == "unknown" and len(game_states) >= 10:
+        final_frames = game_states[-10:]
+        
+        for i in range(1, len(final_frames)):
+            prev = final_frames[i-1]
+            curr = final_frames[i]
+            
+            p1_prev_pct = prev.get("p1_percent") or 0
+            p1_curr_pct = curr.get("p1_percent") or 0
+            p2_prev_pct = prev.get("p2_percent") or 0
+            p2_curr_pct = curr.get("p2_percent") or 0
+            
+            if p1_prev_pct >= 50 and p1_curr_pct < 15:
+                winner = "p2"
+                print(f"[Winner] Final frame P1 reset: {p1_prev_pct}% -> {p1_curr_pct}% -> P2 wins")
+                break
+            if p2_prev_pct >= 50 and p2_curr_pct < 15:
+                winner = "p1"
+                print(f"[Winner] Final frame P2 reset: {p2_prev_pct}% -> {p2_curr_pct}% -> P1 wins")
+                break
+    
+    # Method 6: Percent heuristic - ONLY use when one player is clearly at kill percent
+    # This is a last resort and only works when there's a BIG difference
+    if winner == "unknown":
         last_active_frame = None
         for s in reversed(game_states):
             if s.get("game_active", True):
@@ -312,14 +769,15 @@ def calculate_stats(game_states: list) -> dict:
             p1_last_pct = last_active_frame.get("p1_percent")
             p2_last_pct = last_active_frame.get("p2_percent")
             
-            # The player at HIGHER percent just before "GAME!" was likely KO'd
+            # Only use this heuristic with a LARGE threshold (50%+)
+            # Small differences are unreliable
             if p1_last_pct is not None and p2_last_pct is not None:
-                if p1_last_pct > p2_last_pct + 20:
-                    winner = "p2"  # P1 at higher percent = P1 got KO'd = P2 wins
-                    print(f"[Winner] Last active: P1={p1_last_pct}%, P2={p2_last_pct}% -> P1 likely KO'd -> P2 wins")
-                elif p2_last_pct > p1_last_pct + 20:
-                    winner = "p1"  # P2 at higher percent = P2 got KO'd = P1 wins
-                    print(f"[Winner] Last active: P1={p1_last_pct}%, P2={p2_last_pct}% -> P2 likely KO'd -> P1 wins")
+                if p1_last_pct > p2_last_pct + 50:
+                    winner = "p2"
+                    print(f"[Winner] Large percent diff: P1={p1_last_pct}%, P2={p2_last_pct}% -> P1 likely KO'd -> P2 wins")
+                elif p2_last_pct > p1_last_pct + 50:
+                    winner = "p1"
+                    print(f"[Winner] Large percent diff: P1={p1_last_pct}%, P2={p2_last_pct}% -> P2 likely KO'd -> P1 wins")
     
     # Get final stock counts
     def get_mode(lst):
@@ -362,6 +820,8 @@ def generate_ai_coaching(stats: dict, patterns: dict, tips: list, player_char: s
     basic_summary += f"Found {len(tips)} moments to review."
     
     if not os.getenv("OPENAI_API_KEY"):
+        # Fall back to Gemini for tip enhancement (summary stays basic)
+        tips = enhance_tips_with_gemini(tips, player_char, opponent_char)
         return basic_summary, tips
     
     try:
@@ -471,6 +931,91 @@ Reply with a numbered list: for each number, write ONLY the extra suggestion tex
         return tips
     except Exception as e:
         print(f"Tip enhancement error: {e}")
+        return tips
+
+
+def enhance_tips_with_gemini(tips: list, player_char: str = None, opponent_char: str = None) -> list:
+    """Add short, specific advice to each tip using Gemini (if available)."""
+    if not tips or not GEMINI_AVAILABLE:
+        return tips
+
+    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return tips
+
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel("gemini-2.0-flash")
+
+        o_data = get_character_info(opponent_char) if opponent_char else None
+        p_data = get_character_info(player_char) if player_char else None
+
+        allowed_opponent_moves = []
+        if o_data:
+            allowed_opponent_moves = (
+                o_data.get("key_moves", {}).get("kill", [])[:3] +
+                o_data.get("key_moves", {}).get("neutral", [])[:3]
+            )
+
+        allowed_player_moves = []
+        if p_data:
+            allowed_player_moves = (
+                p_data.get("key_moves", {}).get("neutral", [])[:3] +
+                p_data.get("key_moves", {}).get("combo_starters", [])[:3]
+            )
+
+        payload = []
+        for t in tips[:10]:
+            payload.append({
+                "type": t.get("type"),
+                "timestamp": t.get("timestamp"),
+                "message": t.get("message"),
+                "context_hint": t.get("context_hint"),
+                "your_percent": t.get("your_percent"),
+                "opponent_percent": t.get("opponent_percent"),
+            })
+
+        prompt = f"""You are a Smash Ultimate coach. For each moment, write ONE short, specific suggestion (1-2 sentences).
+
+Rules:
+- Do NOT claim a specific move was used unless it appears in the allowed move list.
+- You may say "watch for moves like X" ONLY if X is in the allowed list.
+- If unsure, use "likely" or "may have" language.
+- Keep it actionable and matchup-aware.
+
+Player: {player_char or "Unknown"}
+Opponent: {opponent_char or "Unknown"}
+Allowed opponent moves: {", ".join(allowed_opponent_moves) or "None"}
+Allowed player moves: {", ".join(allowed_player_moves) or "None"}
+
+Moments (JSON):
+{json.dumps(payload, ensure_ascii=True)}
+
+Return ONLY a JSON array of suggestion strings in the same order."""
+
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.2,
+                max_output_tokens=600,
+            )
+        )
+
+        text = response.text.strip()
+        if "```json" in text:
+            text = text.split("```json")[1].split("```")[0].strip()
+        elif "```" in text:
+            text = text.split("```")[1].split("```")[0].strip()
+
+        suggestions = json.loads(text)
+        if isinstance(suggestions, list):
+            for i, tip in enumerate(tips[: min(len(suggestions), len(tips))]):
+                if isinstance(suggestions[i], str):
+                    tip["ai_advice"] = suggestions[i].strip()
+
+        return tips
+    except Exception as e:
+        print(f"Gemini tip enhancement error: {e}")
         return tips
 
 def generate_summary(stats: dict, patterns: dict, tips: list) -> str:
