@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import axios from 'axios'
 import CharacterSelect from './CharacterSelect'
 import CharacterPortrait from './CharacterPortrait'
@@ -14,6 +14,13 @@ export default function VideoUpload({ onAnalysisStart, onProgress, onAnalysisCom
   const [playerTrigger, setPlayerTrigger] = useState(0)
   const [opponentTrigger, setOpponentTrigger] = useState(0)
   const fileInputRef = useRef()
+  const pollTimeoutRef = useRef(null)
+
+  useEffect(() => {
+    return () => {
+      if (pollTimeoutRef.current) clearTimeout(pollTimeoutRef.current)
+    }
+  }, [])
 
   const handleCharacterSelect = (player, opponent) => {
     setPlayerChar(player || '')
@@ -69,33 +76,38 @@ export default function VideoUpload({ onAnalysisStart, onProgress, onAnalysisCom
   }
 
   const pollForResults = async (videoId, videoUrl) => {
+    let interval = 1500
     const poll = async () => {
       try {
         const { data } = await axios.get(`${API_URL}/results/${videoId}`)
-        
+
         if (data.status === 'complete') {
+          pollTimeoutRef.current = null
           onAnalysisComplete(data, videoUrl)
           return
         }
-        
+
         if (data.status === 'error') {
+          pollTimeoutRef.current = null
           console.error('Analysis failed:', data.error)
           onError()
           return
         }
-        
+
         const progress = data.progress ?? 0
-        // Use ETA from backend
         const etaSeconds = data.eta_seconds ?? null
-        
+
         onProgress({ progress, status: data.status || 'processing', etaSeconds })
-        setTimeout(poll, 500)
+        // Back off gradually: 1.5s → 2s → 2.5s → 3s (cap)
+        interval = Math.min(3000, interval + 250)
+        pollTimeoutRef.current = setTimeout(poll, interval)
       } catch (err) {
         console.error('Poll failed:', err)
+        pollTimeoutRef.current = null
         onError()
       }
     }
-    
+
     poll()
   }
 

@@ -20,11 +20,16 @@ data/videos/*.mp4
 data/videos/*.mov
 data/videos/*.webm
 data/frames/
+data/hitbox_cache/
 *.jpg
 *.png
+*.gif
 
 # Keep saved analyses structure but not the files
 data/saved_analyses/*.json
+
+# Exported clips
+data/clips/
 
 # IDE
 .vscode/

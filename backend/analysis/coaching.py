@@ -6,7 +6,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from analysis.patterns import find_patterns
-from analysis.characters import get_character_tips, get_matchup_advice, get_character_specific_feedback, get_character_info
+from analysis.characters import get_character_tips, get_matchup_advice, get_character_specific_feedback, get_character_info, CHARACTER_DATA
+from analysis.skill_estimator import estimate_skill_level
+from analysis.habits import detect_habits
 
 try:
     import google.generativeai as genai
@@ -40,11 +42,136 @@ def _filter_impossible_tips(tips: list) -> list:
     return filtered
 
 
+def _deduplicate_tips(tips: list) -> list:
+    """Remove redundant tips that describe the same event at different granularities."""
+    if not tips:
+        return tips
+
+    # Index tips by type for fast lookup
+    by_type = {}
+    for i, t in enumerate(tips):
+        by_type.setdefault(t.get("type", ""), []).append((i, t))
+
+    remove_indices = set()
+
+    # If damage_taken and stock_lost within 2s, remove damage_taken (stock loss subsumes it)
+    for _, dt_tip in by_type.get("damage_taken", []):
+        dt_ts = dt_tip.get("timestamp", 0)
+        for _, sl_tip in by_type.get("stock_lost", []):
+            if abs(sl_tip.get("timestamp", 0) - dt_ts) <= 2:
+                remove_indices.add(id(dt_tip))
+                break
+
+    # If got_edgeguarded and stock_lost within 3s, keep got_edgeguarded (more specific)
+    for _, sl_tip in by_type.get("stock_lost", []):
+        sl_ts = sl_tip.get("timestamp", 0)
+        for _, eg_tip in by_type.get("got_edgeguarded", []):
+            if abs(eg_tip.get("timestamp", 0) - sl_ts) <= 3:
+                remove_indices.add(id(sl_tip))
+                break
+
+    return [t for t in tips if id(t) not in remove_indices]
+
+
+def _prioritize_tips(tips: list) -> list:
+    """Score and rank tips by importance. Top 8 get priority='high', rest get 'normal'."""
+    if not tips:
+        return tips
+
+    BASE_SCORES = {
+        "stock_lost": 90,
+        "got_edgeguarded": 85,
+        "damage_taken": 60,
+        "edgeguard": 60,
+        "combo": 45,
+        "stock_taken": 50,
+        "momentum_disadvantage": 40,
+        "damage_dealt": 30,
+        "momentum_advantage": 25,
+        "neutral": 20,
+        "habit": 15,
+        "character_tip": 10,
+    }
+
+    for tip in tips:
+        tip_type = tip.get("type", "")
+        score = BASE_SCORES.get(tip_type, 20)
+
+        # Severity boost for damage_taken
+        if tip_type == "damage_taken" and tip.get("severity") == "high":
+            score = 70
+
+        # Big combos are more interesting
+        if tip_type == "combo" and (tip.get("damage") or 0) > 30:
+            score = 55
+
+        # Vision-enhanced tips are more valuable
+        if tip.get("enhanced"):
+            score += 10
+        if tip.get("multi_frame"):
+            score += 5
+
+        tip["_priority_score"] = score
+
+    # Sort by score descending to assign ranks
+    scored = sorted(tips, key=lambda t: (-t["_priority_score"], t.get("timestamp", 0)))
+
+    for rank, tip in enumerate(scored, 1):
+        tip["priority"] = "high" if rank <= 8 else "normal"
+        tip["priority_rank"] = rank
+        del tip["_priority_score"]
+
+    # Re-sort by timestamp so both sections display chronologically
+    return sorted(scored, key=lambda t: t.get("timestamp", 0))
+
+
 def _nearest_state(states: list, timestamp: float) -> dict:
     """Find the game state closest to the given timestamp."""
     if not states:
         return None
     return min(states, key=lambda s: abs(s.get("timestamp", 0) - timestamp))
+
+
+# Build set of all character display names for hallucination detection
+_ALL_CHARACTER_NAMES = set()
+for _key, _data in CHARACTER_DATA.items():
+    _ALL_CHARACTER_NAMES.add(_data["name"].lower())
+    _ALL_CHARACTER_NAMES.add(_key.lower())
+
+
+def _validate_character_names(text: str, player_char: str, opponent_char: str) -> str:
+    """Replace hallucinated character names in AI output with the correct ones."""
+    if not text or not player_char or not opponent_char:
+        return text
+
+    import re
+
+    # Normalize allowed names
+    p_info = get_character_info(player_char)
+    o_info = get_character_info(opponent_char)
+    allowed = set()
+    if p_info:
+        allowed.add(p_info["name"].lower())
+    if o_info:
+        allowed.add(o_info["name"].lower())
+    allowed.add(player_char.lower())
+    allowed.add(opponent_char.lower())
+
+    player_display = p_info["name"] if p_info else player_char.title()
+    opponent_display = o_info["name"] if o_info else opponent_char.title()
+
+    for char_name in _ALL_CHARACTER_NAMES:
+        if char_name in allowed:
+            continue
+        # Case-insensitive replacement of wrong character names
+        pattern = re.compile(re.escape(char_name), re.IGNORECASE)
+        if pattern.search(text):
+            # Heuristic: if context says "your" or "you", replace with player char;
+            # otherwise replace with opponent char
+            # Simple approach: just replace with the opponent (most common hallucination)
+            text = pattern.sub(opponent_display, text)
+
+    return text
 
 
 def _get_opponent_move_hints(opponent_char: str, category: str = "kill") -> list:
@@ -210,9 +337,10 @@ def _add_specificity_to_tips(
     patterns: dict,
     states: list,
     player_char: str = None,
-    opponent_char: str = None
+    opponent_char: str = None,
+    skill_tier: str = None,
 ) -> list:
-    """Make tips more specific using rule-based context and matchup hints."""
+    """Make tips more specific using rule-based context, matchup hints, and skill tier."""
     if not tips:
         return tips
 
@@ -239,16 +367,36 @@ def _add_specificity_to_tips(
 
             if _recent_damage_dealt(ts, window=2.0):
                 context_hint = "overextension_reversal"
-                detail = "This looks like a quick reversal after your hit—reset spacing or shield after advantage to avoid an immediate punish."
+                if skill_tier in ("high", "top"):
+                    detail = "Reversal after your advantage—consider whether you're missing a frame trap or overextending past your safe window."
+                elif skill_tier == "mid":
+                    detail = "Quick reversal after your hit—reset spacing or shield after advantage to avoid the punish."
+                else:
+                    detail = "You got hit right after attacking. Try shielding or backing off after landing a hit instead of rushing in again."
             elif (to_pct if isinstance(to_pct, (int, float)) else 0) >= 100:
                 context_hint = "high_percent_defense"
-                detail = "At high percent, prioritize safe landings and avoid drifting into burst range."
+                if skill_tier in ("high", "top"):
+                    detail = "At kill percent, identify their burst range and avoid positions where they can confirm. Mix platform escape routes."
+                elif skill_tier == "mid":
+                    detail = "At high percent, prioritize safe landings and avoid drifting into burst range."
+                else:
+                    detail = "You're at high percent—be extra careful! Try staying near the center of the stage and shielding more."
             elif (from_pct if isinstance(from_pct, (int, float)) else 0) <= 30:
                 context_hint = "early_opening"
-                detail = "At low percent, avoid autopilot approaches; use safer pokes and space just outside their range."
+                if skill_tier in ("high", "top"):
+                    detail = "Opening-stage damage—analyze the spacing trap and whether you fell for a bait or committed to an unsafe approach."
+                elif skill_tier == "mid":
+                    detail = "At low percent, avoid autopilot approaches; use safer pokes and space just outside their range."
+                else:
+                    detail = "Try not to rush in at the start. Use safer moves from a distance and wait for an opening."
             else:
                 context_hint = "mid_percent_defense"
-                detail = "Mix defensive options (drift, fast-fall timing, shield) to avoid taking the follow-up."
+                if skill_tier in ("high", "top"):
+                    detail = "Identify the spacing trap. Consider DI mixups and platform escape routes to avoid follow-ups."
+                elif skill_tier == "mid":
+                    detail = "Mix defensive options (drift, fast-fall timing, shield) to avoid taking the follow-up."
+                else:
+                    detail = "Try shielding or jumping away when you see them coming. Don't just stand still."
 
             opp_kill_moves = _get_opponent_move_hints(opponent_char, "kill")
             if opp_kill_moves and (to_pct if isinstance(to_pct, (int, float)) else 0) >= 90:
@@ -264,10 +412,20 @@ def _add_specificity_to_tips(
             pct_val = percent if isinstance(percent, (int, float)) else 0
             if pct_val < 60:
                 context_hint = "early_stock_loss"
-                detail = "Early stock—likely off a setup or edgeguard. Mix your recovery timing and avoid predictable landings."
+                if skill_tier in ("high", "top"):
+                    detail = "Very early kill—analyze whether you got hit by a setup, failed DI on a confirm, or recovered predictably."
+                elif skill_tier == "mid":
+                    detail = "Early stock—likely off a setup or edgeguard. Mix your recovery timing and avoid predictable landings."
+                else:
+                    detail = "You died very early! The opponent probably hit you offstage. Try mixing up how you get back to the stage."
             elif pct_val < 100:
                 context_hint = "mid_stock_loss"
-                detail = "Mid-percent loss—review your defensive choice and DI in that exchange."
+                if skill_tier in ("high", "top"):
+                    detail = "Mid-percent kill—check if your DI was optimal for the kill move and if you could have teched."
+                elif skill_tier == "mid":
+                    detail = "Mid-percent loss—review your defensive choice and DI in that exchange."
+                else:
+                    detail = "You lost a stock at a pretty normal percent. Try holding the control stick away from where you're flying to survive longer."
             elif pct_val < 150:
                 context_hint = "standard_stock_loss"
                 detail = "Standard kill percent—prioritize DI mixups and safer landings."
@@ -301,9 +459,13 @@ def _add_specificity_to_tips(
             else:
                 kill_type = "Got the KO"
                 context_hint = "late_kill"
-                detail = "High-percent KO—good patience; keep them cornered to avoid reversals."
-            
-            # Add opponent escape options to help player read/anticipate defensive options
+                if skill_tier in ("high", "top"):
+                    detail = "Took too long to close—work on kill confirms earlier and covering escape options at lower percents."
+                elif skill_tier == "mid":
+                    detail = "High-percent KO—good patience; keep them cornered to avoid reversals."
+                else:
+                    detail = "You got the KO! The opponent survived a long time though. Try using your stronger moves (smash attacks) when they're at high percent."
+
             escape_options = _get_opponent_escape_options(opponent_char, pct_val)
             if escape_options:
                 detail += f" Tip*: {escape_options}"
@@ -325,11 +487,17 @@ def _add_specificity_to_tips(
             to_pct = tip.get("to_percent", from_pct + tip.get("damage", 0))
             damage = tip.get("damage", 0)
             context_hint = "combo_extension"
-            tip["message"] = f"Nice combo dealing {_fmt_pct(damage)} damage ({_fmt_pct(from_pct)} → {_fmt_pct(to_pct)}). Track DI and be ready to catch their landing with safe follow-ups."
+            if skill_tier in ("high", "top"):
+                tip["message"] = f"Combo: {_fmt_pct(damage)} damage ({_fmt_pct(from_pct)} → {_fmt_pct(to_pct)}). Check if DI-dependent extensions were covered and if you reached the optimal combo ender for this percent."
+            else:
+                tip["message"] = f"Nice combo dealing {_fmt_pct(damage)} damage ({_fmt_pct(from_pct)} → {_fmt_pct(to_pct)}). Track DI and be ready to catch their landing with safe follow-ups."
 
         elif tip_type == "neutral":
             context_hint = "neutral_stall"
-            tip["message"] = f"Extended neutral ({tip.get('duration', 0):.0f}s). Use safe pokes and movement to force a reaction instead of overcommitting."
+            if skill_tier in ("high", "top"):
+                tip["message"] = f"Neutral stall ({tip.get('duration', 0):.0f}s). Identify whether you're both playing passive and who benefits from the timeout. Take micro-space with safe aerials and dash-dance."
+            else:
+                tip["message"] = f"Extended neutral ({tip.get('duration', 0):.0f}s). Use safe pokes and movement to force a reaction instead of overcommitting."
 
         elif tip_type == "edgeguard":
             context_hint = "edgeguard_success"
@@ -362,6 +530,443 @@ def _add_specificity_to_tips(
     return tips
 
 
+def compute_top3_focus_areas(
+    skill_profile: dict, habit_report: dict, patterns: dict,
+    stats: dict, player_char: str = None, opponent_char: str = None,
+) -> list:
+    """
+    Compute the top 3 things the player should work on, with character-specific drills.
+    Pure computation — zero API cost.
+    """
+    import statistics as _stats_mod
+
+    candidates = []
+
+    # --- Source 1: Weak skill metrics (score < 55) ---
+    METRIC_FOCUS = {
+        "damage_per_opening": {
+            "title": "Punish game",
+            "explain": "You're not converting openings into enough damage. Focus on follow-ups after landing a hit.",
+            "drill_category": "combo_starters",
+            "drill_template": "Practice {moves} into follow-up aerials at 0-60%",
+        },
+        "kill_efficiency": {
+            "title": "Closing out stocks",
+            "explain": "You're letting opponents live too long. Work on confirming kills at the right percent.",
+            "drill_category": "kill",
+            "drill_template": "Practice {moves} confirms at kill percent (80-120%)",
+        },
+        "edgeguard_rate": {
+            "title": "Edgeguarding",
+            "explain": "You're letting opponents recover for free. Going offstage is a major source of early kills.",
+            "drill_category": "edgeguard",
+            "drill_template": "Practice going offstage with {moves} when opponent is recovering",
+        },
+        "death_percent": {
+            "title": "Survival and DI",
+            "explain": "You're dying too early. Better DI and recovery mixups would extend your stocks significantly.",
+            "drill_category": None,
+            "drill_template": "Practice DI-ing away from kill moves and mixing up recovery timing",
+        },
+        "post_death_vulnerability": {
+            "title": "Post-respawn composure",
+            "explain": "You're taking too much damage right after respawning. Use invincibility frames wisely and reset to neutral.",
+            "drill_category": "neutral",
+            "drill_template": "After respawn: use invincibility to reposition with {moves}, don't attack immediately",
+        },
+        "combo_quality": {
+            "title": "Combo optimization",
+            "explain": "Your combos aren't dealing enough damage. Learn your character's true combo routes.",
+            "drill_category": "combo_starters",
+            "drill_template": "Practice {moves} into full combo routes in training mode",
+        },
+        "neutral_duration": {
+            "title": "Neutral game",
+            "explain": "Neutral phases are lasting too long. Find ways to create openings and force approaches.",
+            "drill_category": "neutral",
+            "drill_template": "Practice approaching with {moves} and mixing up timing",
+        },
+        "lead_conversion": {
+            "title": "Closing out games",
+            "explain": "You're losing leads after getting ahead. Play more patiently when you have a stock lead.",
+            "drill_category": "kill",
+            "drill_template": "When ahead, focus on safe {moves} confirms instead of risky plays",
+        },
+    }
+
+    metrics = skill_profile.get("metrics", {}) if skill_profile else {}
+    for key, m in metrics.items():
+        score = m.get("score", 50)
+        if score < 55 and key in METRIC_FOCUS:
+            deficit = max(0, 55 - score)
+            focus = METRIC_FOCUS[key]
+            candidates.append({
+                "title": focus["title"],
+                "stat_line": f"Score: {int(score)}/100",
+                "explanation": focus["explain"],
+                "drill_category": focus["drill_category"],
+                "drill_template": focus["drill_template"],
+                "priority_score": deficit,
+                "source": f"metric:{key}",
+            })
+
+    # --- Source 2: Detected habits ---
+    HABIT_OVERLAP = {
+        "post_death_panic": "post_death_vulnerability",
+        "early_deaths": "death_percent",
+        "passive_neutral": "neutral_duration",
+        "overaggressive_neutral": "neutral_duration",
+    }
+    severity_scores = {"critical": 40, "notable": 25, "info": 10}
+    habits = habit_report.get("habits", []) if habit_report else []
+
+    for habit in habits:
+        # Skip if overlapping metric already covers this
+        overlapping_metric = HABIT_OVERLAP.get(habit.get("habit_type"))
+        if overlapping_metric and any(c["source"] == f"metric:{overlapping_metric}" for c in candidates):
+            # Boost the existing metric candidate instead
+            for c in candidates:
+                if c["source"] == f"metric:{overlapping_metric}":
+                    c["priority_score"] += severity_scores.get(habit["severity"], 10) * 0.5
+                    break
+            continue
+
+        candidates.append({
+            "title": habit["description"].split(":")[0] if ":" in habit["description"] else habit["description"],
+            "stat_line": f"{habit['occurrences']}x detected",
+            "explanation": habit.get("suggestion", habit["evidence"]),
+            "drill_category": None,
+            "drill_template": habit.get("suggestion", ""),
+            "priority_score": severity_scores.get(habit["severity"], 10),
+            "source": f"habit:{habit.get('habit_type', '')}",
+        })
+
+    # --- Source 3: Pattern-derived insights ---
+    stock_losses = patterns.get("stock_losses", [])
+    kills = patterns.get("kills", [])
+    edgeguards = patterns.get("edgeguards", [])
+
+    # No edgeguards at all
+    if not edgeguards and kills and not any(c["source"] == "metric:edgeguard_rate" for c in candidates):
+        candidates.append({
+            "title": "Start edgeguarding",
+            "stat_line": "0 edgeguards this game",
+            "explanation": "You never went offstage to challenge recovery. Even one edgeguard attempt per game builds the habit.",
+            "drill_category": "edgeguard",
+            "drill_template": "Practice going offstage with {moves} when opponent is recovering",
+            "priority_score": 20,
+            "source": "pattern:no_edgeguards",
+        })
+
+    # All deaths at low percent
+    if len(stock_losses) >= 2:
+        death_pcts = [sl.get("percent", 0) for sl in stock_losses if sl.get("percent")]
+        if death_pcts and max(death_pcts) < 90:
+            if not any(c["source"] == "metric:death_percent" for c in candidates):
+                candidates.append({
+                    "title": "Surviving longer",
+                    "stat_line": f"Avg death at {sum(death_pcts)/len(death_pcts):.0f}%",
+                    "explanation": "You're dying very early. Focus on DI and recovery mixups to live longer.",
+                    "drill_category": None,
+                    "drill_template": "Practice DI-ing away from kill moves and mixing up recovery",
+                    "priority_score": 30,
+                    "source": "pattern:early_deaths",
+                })
+
+    # Sort by priority score (highest first) and take top 3
+    candidates.sort(key=lambda c: c["priority_score"], reverse=True)
+    top3 = candidates[:3]
+
+    # Generate character-specific drills
+    char_data = get_character_info(player_char) if player_char else None
+    key_moves = char_data.get("key_moves", {}) if char_data else {}
+
+    results = []
+    for area in top3:
+        drills = []
+        cat = area.get("drill_category")
+        template = area.get("drill_template", "")
+
+        if cat and key_moves.get(cat):
+            moves = key_moves[cat][:3]
+            moves_str = ", ".join(moves)
+            drills.append(template.format(moves=moves_str))
+        elif template and "{moves}" not in template:
+            drills.append(template)
+        elif template:
+            drills.append(template.replace("{moves}", "safe options"))
+
+        # Add a generic secondary drill based on category
+        if cat == "kill" and key_moves.get("kill"):
+            drills.append(f"In training mode, practice kill confirms with {key_moves['kill'][0]} at 80-130%")
+        elif cat == "combo_starters" and key_moves.get("combo_starters"):
+            drills.append(f"Lab {key_moves['combo_starters'][0]} follow-ups at low, mid, and high percent")
+
+        results.append({
+            "title": area["title"],
+            "stat_line": area["stat_line"],
+            "explanation": area["explanation"],
+            "drills": drills[:2],
+            "priority_score": area["priority_score"],
+        })
+
+    return results
+
+
+def compute_opponent_report(
+    patterns: dict, stats: dict, game_states: list,
+    player_char: str = None, opponent_char: str = None,
+    skill_profile: dict = None,
+) -> dict:
+    """
+    Build a scouting report on the opponent's tendencies.
+    Pure computation — zero API cost.
+    """
+    import statistics as _stats_mod
+    from analysis.move_data import identify_best_move
+
+    stock_losses = patterns.get("stock_losses", [])
+    damage_spikes = patterns.get("damage_spikes", [])
+    damage_dealt = patterns.get("damage_dealt", [])
+    long_neutral = patterns.get("long_neutral", [])
+    got_edgeguarded = patterns.get("got_edgeguarded", [])
+    kills = patterns.get("kills", [])
+
+    # --- 1. How they killed you ---
+    # At 3fps OCR, damage deltas can't reliably identify specific moves:
+    # a single move's damage may be split across frames, and combos get
+    # merged into one delta. Instead, report each death with the damage
+    # burst pattern and flag notable situations (early kills, spikes).
+    deaths_detail = []
+    for loss in stock_losses:
+        death_ts = loss.get("timestamp", 0)
+        death_pct = loss.get("percent", 0)
+
+        # Collect damage deltas from game_states in 4s before death
+        deltas = []
+        for i, gs in enumerate(game_states):
+            ts = gs.get("timestamp", 0)
+            if ts > death_ts:
+                break
+            if death_ts - ts > 4:
+                continue
+            if i == 0:
+                continue
+            prev = game_states[i - 1]
+            p1_now = gs.get("p1_percent") or 0
+            p1_prev = prev.get("p1_percent") or 0
+            delta = p1_now - p1_prev
+            if delta > 3:
+                deltas.append({"ts": ts, "delta": delta, "to_pct": p1_now})
+
+        total_burst = sum(d["delta"] for d in deltas) if deltas else 0
+        burst_duration = (deltas[-1]["ts"] - deltas[0]["ts"]) if len(deltas) >= 2 else 0
+
+        # Build death description
+        detail = {"kill_percent": death_pct, "burst_damage": round(total_burst, 1)}
+
+        if death_pct < 80:
+            detail["flag"] = "early kill"
+            # Check if we got edgeguarded at this time
+            got_eg = any(
+                abs(eg.get("timestamp", 0) - death_ts) < 3
+                for eg in got_edgeguarded
+            )
+            if got_eg:
+                detail["description"] = f"Killed at {death_pct:.0f}% (edgeguarded/spiked)"
+            else:
+                detail["description"] = f"Killed at {death_pct:.0f}% — early kill, likely a spike or offstage KO"
+        elif total_burst > 5:
+            detail["description"] = f"Killed at {death_pct:.0f}% after taking {total_burst:.0f}% in {burst_duration:.1f}s"
+        else:
+            detail["description"] = f"Killed at {death_pct:.0f}%"
+
+        deaths_detail.append(detail)
+
+    # Aggregate kill percent stats
+    kill_percents = [d["kill_percent"] for d in deaths_detail if d["kill_percent"]]
+    avg_kill_pct = sum(kill_percents) / len(kill_percents) if kill_percents else 0
+    early_kills = sum(1 for d in deaths_detail if d.get("flag") == "early kill")
+
+    # --- 2. Neutral tendencies ---
+    your_openings = len(damage_dealt)
+    their_openings = len(damage_spikes)
+    aggression_ratio = their_openings / max(1, your_openings)
+
+    if aggression_ratio > 1.3:
+        neutral_tendency = "aggressive"
+        neutral_desc = "Your opponent played aggressively, creating more openings than you. Look for ways to punish their approaches."
+    elif aggression_ratio < 0.7:
+        neutral_tendency = "defensive"
+        neutral_desc = "Your opponent played defensively, letting you approach more often. Mix up your approach timing and bait their defensive options."
+    else:
+        neutral_tendency = "balanced"
+        neutral_desc = "The neutral game was fairly even. Focus on winning more of these exchanges through spacing and timing."
+
+    if len(long_neutral) >= 3:
+        neutral_desc += " There were multiple extended neutral phases — the opponent is patient."
+
+    # --- 3. Exploitable patterns ---
+    exploitable = []
+
+    # Predictable kill percent
+    if len(stock_losses) >= 2:
+        death_pcts = [sl.get("percent", 0) for sl in stock_losses if sl.get("percent")]
+        if len(death_pcts) >= 2:
+            try:
+                std = _stats_mod.stdev(death_pcts)
+                if std < 15:
+                    avg = sum(death_pcts) / len(death_pcts)
+                    exploitable.append(
+                        f"Opponent kills at a consistent percent range (~{avg:.0f}%). "
+                        f"Expect their kill setup around this percent and prepare to DI or shield."
+                    )
+            except _stats_mod.StatisticsError:
+                pass
+
+    # Opponent doesn't edgeguard
+    if stock_losses and len(got_edgeguarded) == 0:
+        p_data = get_character_info(player_char) if player_char else None
+        exploitable.append(
+            "Opponent never went offstage to edgeguard you. "
+            "You can recover more safely and predictably — save your mixups for when they start challenging."
+        )
+
+    # Opponent is passive
+    if len(long_neutral) >= 3 and neutral_tendency != "aggressive":
+        p_data = get_character_info(player_char)
+        neutral_moves = p_data.get("key_moves", {}).get("neutral", [])[:2] if p_data else []
+        if neutral_moves:
+            exploitable.append(
+                f"Opponent plays passively. Approach with {', '.join(neutral_moves)} and force them to react."
+            )
+        else:
+            exploitable.append("Opponent plays passively. Approach more often and force reactions.")
+
+    # --- 4. Character-specific tips ---
+    o_data = get_character_info(opponent_char) if opponent_char else None
+    char_tips = o_data.get("tips_against", [])[:3] if o_data else []
+
+    # --- Summary ---
+    summary_parts = []
+    if deaths_detail:
+        summary_parts.append(f"You died {len(deaths_detail)} time(s) (avg {avg_kill_pct:.0f}%)")
+        if early_kills:
+            summary_parts.append(f"{early_kills} early kill(s) — watch for spikes/edgeguards")
+    summary_parts.append(f"Their neutral was {neutral_tendency}")
+    if exploitable:
+        summary_parts.append(f"{len(exploitable)} exploitable pattern(s) found")
+
+    return {
+        "deaths": deaths_detail,
+        "avg_kill_percent": round(avg_kill_pct, 1),
+        "early_kills": early_kills,
+        "neutral_tendency": neutral_tendency,
+        "neutral_description": neutral_desc,
+        "exploitable_patterns": exploitable,
+        "character_tips": char_tips,
+        "summary": ". ".join(summary_parts) + ".",
+    }
+
+
+def compute_matchup_gameplan(
+    player_char: str, opponent_char: str,
+    patterns: dict = None, stats: dict = None,
+) -> dict:
+    """
+    Build a pre-match game plan based on character matchup data.
+    Pure computation from character database — zero API cost.
+    """
+    p_data = get_character_info(player_char) if player_char else None
+    o_data = get_character_info(opponent_char) if opponent_char else None
+
+    if not p_data and not o_data:
+        return None
+
+    # Archetype advantage insights
+    ARCHETYPE_TIPS = {
+        ("rushdown", "zoner"): "Get in close and stay aggressive. Don't let them zone you out.",
+        ("rushdown", "heavyweight"): "Use your speed advantage. Hit and run — don't trade hits.",
+        ("zoner", "rushdown"): "Keep them out with projectiles. Don't let them get in for free.",
+        ("zoner", "heavyweight"): "Wall them out. They struggle to approach through projectiles.",
+        ("heavyweight", "rushdown"): "One solid read wins the exchange. Be patient and punish overcommitment.",
+        ("heavyweight", "zoner"): "Use your range and armor to push through projectiles. Close the gap.",
+        ("swordfighter", "rushdown"): "Use your disjoint to stuff approaches. Space with tilts and aerials.",
+        ("rushdown", "swordfighter"): "Get inside their sword range. Parry or shield their pokes and punish.",
+        ("all-rounder", "zoner"): "Mix approaches with your balanced kit. You can play their game or rush in.",
+        ("grappler", "zoner"): "Shield through projectiles and grab. One read leads to huge damage.",
+    }
+
+    p_arch = p_data.get("archetype", "").lower() if p_data else ""
+    o_arch = o_data.get("archetype", "").lower() if o_data else ""
+
+    # --- Win conditions ---
+    win_conditions = []
+    p_strengths = p_data.get("strengths", []) if p_data else []
+    o_weaknesses = o_data.get("weaknesses", []) if o_data else []
+
+    for s in p_strengths:
+        s_lower = s.lower()
+        for w in o_weaknesses:
+            w_lower = w.lower()
+            # Look for strength-weakness overlaps
+            if any(kw in s_lower and kw in w_lower for kw in
+                   ["range", "speed", "combo", "edge", "recover", "kill", "projectile", "air", "weight"]):
+                win_conditions.append(f"Your {s.lower()} exploits their {w.lower()}")
+
+    archetype_tip = ARCHETYPE_TIPS.get((p_arch, o_arch))
+    if archetype_tip:
+        win_conditions.append(archetype_tip)
+
+    if not win_conditions:
+        # Generic win condition from strengths
+        if p_strengths:
+            win_conditions.append(f"Lean on your strengths: {', '.join(p_strengths[:2]).lower()}")
+
+    # --- Watch for (opponent threats) ---
+    watch_for = []
+    o_kill_moves = o_data.get("key_moves", {}).get("kill", []) if o_data else []
+    o_strengths = o_data.get("strengths", []) if o_data else []
+
+    if o_kill_moves:
+        watch_for.append(f"Kill moves to respect: {', '.join(o_kill_moves[:3])}")
+    if o_strengths:
+        watch_for.append(f"Their strengths: {', '.join(o_strengths[:2]).lower()}")
+
+    # --- Neutral approach ---
+    neutral_approach = []
+    p_neutral = p_data.get("key_moves", {}).get("neutral", []) if p_data else []
+    p_tips_as = p_data.get("tips_as", []) if p_data else []
+    o_tips_against = o_data.get("tips_against", []) if o_data else []
+
+    if p_neutral:
+        neutral_approach.append(f"Your best neutral tools: {', '.join(p_neutral[:3])}")
+    if p_tips_as:
+        neutral_approach.append(p_tips_as[0])
+    if o_tips_against:
+        neutral_approach.append(o_tips_against[0])
+
+    # --- Key interactions ---
+    key_interactions = []
+    p_combo = p_data.get("key_moves", {}).get("combo_starters", []) if p_data else []
+    p_edgeguard = p_data.get("key_moves", {}).get("edgeguard", []) if p_data else []
+    p_kill = p_data.get("key_moves", {}).get("kill", []) if p_data else []
+
+    if p_combo:
+        key_interactions.append(f"Combo starters: {', '.join(p_combo[:2])} — look for these at low percent")
+    if p_edgeguard:
+        key_interactions.append(f"Edgeguard with: {', '.join(p_edgeguard[:2])}")
+    if p_kill:
+        key_interactions.append(f"Kill confirms: {', '.join(p_kill[:2])} at 80-130%")
+
+    return {
+        "win_conditions": win_conditions[:3],
+        "watch_for": watch_for[:3],
+        "neutral_approach": neutral_approach[:3],
+        "key_interactions": key_interactions[:3],
+    }
+
+
 def _swap_game_states(game_states: list) -> list:
     """Swap P1 and P2 in each state so we can treat P2 as 'you' when you_are_p1 is False."""
     return [
@@ -378,30 +983,57 @@ def _swap_game_states(game_states: list) -> list:
     ]
 
 
-def generate_coaching(game_states: list, player_char: str = None, opponent_char: str = None, you_are_p1: bool = True) -> dict:
+def generate_coaching(
+    game_states: list,
+    player_char: str = None,
+    opponent_char: str = None,
+    you_are_p1: bool = True,
+    video_path: str = None,
+) -> dict:
     """
     Analyze game states and generate coaching feedback from your perspective.
-    
+
     Args:
         game_states: List of game state dictionaries from video processing
         player_char: Your character (optional)
         opponent_char: Opponent character (optional)
-        you_are_p1: True if you are the left/red player (P1), False if you are the right/blue player (P2)
+        you_are_p1: True if you are the left/red player (P1), False if right/blue (P2)
+        video_path: If provided, run offstage classifier to gate edgeguard labels (no false edgeguards)
     """
     if not game_states:
         return {"summary": "No game data detected. Make sure the video shows gameplay with the HUD visible.", "tips": []}
-    
+
     # Normalize so that "you" are always P1 in the data we analyze
     states_to_analyze = game_states if you_are_p1 else _swap_game_states(game_states)
-    
+
     patterns = find_patterns(states_to_analyze)
+
+    # Gate edgeguard / got_edgeguarded on offstage evidence (vision) when video is available
+    if video_path:
+        try:
+            from cv.offstage_classifier import refine_edgeguards_with_vision
+            refine_edgeguards_with_vision(video_path, patterns, you_are_p1=you_are_p1)
+        except Exception as e:
+            import traceback
+            print(f"[Coaching] Offstage classifier failed (edgeguards unchanged): {e}")
+            traceback.print_exc()
+
     raw_stats = calculate_stats(states_to_analyze)
-    
+
     # Resolve character identities from the normalized state (P1 = you, P2 = opponent)
     if not player_char or not opponent_char:
         auto_player, auto_opponent = detect_match_characters(states_to_analyze)
         player_char = player_char or auto_player
         opponent_char = opponent_char or auto_opponent
+
+    # --- Skill estimation & habit detection (zero API cost) ---
+    skill_profile = estimate_skill_level(
+        patterns, states_to_analyze, player_char, opponent_char
+    )
+    habit_report = detect_habits(
+        patterns, states_to_analyze, player_char, opponent_char
+    )
+    skill_tier = skill_profile.get("tier", "mid")
     
     tips = []
     
@@ -557,6 +1189,18 @@ def generate_coaching(game_states: list, player_char: str = None, opponent_char:
                     "damage_taken": swing.get("damage_taken", 0),
                 })
     
+    # add habit-based tips
+    for habit in habit_report.get("habits", []):
+        tips.append({
+            "timestamp": 0,
+            "type": "habit",
+            "severity": habit.get("severity", "info"),
+            "message": f"[Habit] {habit['description']}: {habit['suggestion']}",
+            "habit_type": habit.get("habit_type"),
+            "evidence": habit.get("evidence"),
+            "occurrences": habit.get("occurrences", 0),
+        })
+
     # add character-specific tips
     char_tips = get_character_specific_feedback(player_char, opponent_char, patterns)
     for char_tip in char_tips:
@@ -567,11 +1211,14 @@ def generate_coaching(game_states: list, player_char: str = None, opponent_char:
     # drop tips with impossible game-state (OCR errors: 188% damage, stock lost at 188%, etc.)
     tips = _filter_impossible_tips(tips)
 
-    # add rule-based specificity and matchup context
-    tips = _add_specificity_to_tips(tips, patterns, states_to_analyze, player_char, opponent_char)
+    # add rule-based specificity and matchup context (calibrated by skill tier)
+    tips = _add_specificity_to_tips(tips, patterns, states_to_analyze, player_char, opponent_char, skill_tier=skill_tier)
     
     # generate AI summary and enhance tips with factual advice only
-    summary, enhanced_tips = generate_ai_coaching(raw_stats, patterns, tips, player_char, opponent_char)
+    summary, enhanced_tips = generate_ai_coaching(
+        raw_stats, patterns, tips, player_char, opponent_char,
+        skill_profile=skill_profile, habit_report=habit_report,
+    )
     
     # Normalize stats for frontend: always "your" and "opponent" (no p1/p2)
     # Use raw stats max (unsmoothed) - this is the TRUE maximum percent reached
@@ -589,15 +1236,34 @@ def generate_coaching(game_states: list, player_char: str = None, opponent_char:
         "winner": raw_stats.get("winner"),
     }
     
+    # --- Top 3 focus areas, opponent scouting, matchup gameplan (zero API cost) ---
+    top3_focus = compute_top3_focus_areas(
+        skill_profile, habit_report, patterns, raw_stats, player_char, opponent_char
+    )
+    opponent_report = compute_opponent_report(
+        patterns, raw_stats, states_to_analyze, player_char, opponent_char, skill_profile
+    )
+    matchup_gameplan = compute_matchup_gameplan(
+        player_char, opponent_char, patterns, raw_stats
+    )
+
+    sorted_tips = sorted(enhanced_tips or tips, key=lambda x: x["timestamp"])
+    prioritized_tips = _prioritize_tips(_deduplicate_tips(sorted_tips))
+
     return {
         "summary": summary,
         "stats": stats,
-        "tips": sorted(enhanced_tips or tips, key=lambda x: x["timestamp"]),
+        "tips": prioritized_tips,
         "patterns": patterns,
         "characters": {
             "player": player_char,
             "opponent": opponent_char
-        }
+        },
+        "skill_profile": skill_profile,
+        "habits": habit_report.get("habits", []),
+        "top3_focus_areas": top3_focus,
+        "opponent_report": opponent_report,
+        "matchup_gameplan": matchup_gameplan,
     }
 
 def detect_match_characters(game_states: list) -> tuple:
@@ -807,30 +1473,34 @@ def get_stock_loss_advice(percent: int) -> str:
     else:
         return "Late stock. Good survival, but you might've been able to close out earlier."
 
-def generate_ai_coaching(stats: dict, patterns: dict, tips: list, player_char: str = None, opponent_char: str = None) -> tuple:
+def generate_ai_coaching(
+    stats: dict, patterns: dict, tips: list,
+    player_char: str = None, opponent_char: str = None,
+    skill_profile: dict = None, habit_report: dict = None,
+) -> tuple:
     """Generate AI-powered summary and enhanced tips (stats are already from 'you' = P1 perspective)."""
-    
+
     duration = stats.get("duration", 0)
     mins = int(duration // 60)
     secs = int(duration % 60)
     you_won = stats.get("winner") == "p1"
-    
+
     basic_summary = f"Match duration: {mins}:{secs:02d}. "
     basic_summary += "You won this game. " if you_won else "You lost this game. "
     basic_summary += f"Found {len(tips)} moments to review."
-    
+
     if not os.getenv("OPENAI_API_KEY"):
         # Fall back to Gemini for tip enhancement (summary stays basic)
         tips = enhance_tips_with_gemini(tips, player_char, opponent_char)
         return basic_summary, tips
-    
+
     try:
         from openai import OpenAI
         client = OpenAI()
-        
+
         damage_spikes = patterns.get("damage_spikes", [])
         stock_losses = patterns.get("stock_losses", [])
-        
+
         char_context = ""
         if player_char:
             p_data = get_character_info(player_char)
@@ -845,15 +1515,51 @@ def generate_ai_coaching(stats: dict, patterns: dict, tips: list, player_char: s
                 char_context += f"\nOPPONENT: {o_data['name']} ({o_data['archetype']})"
                 char_context += f"\n- Kill moves to respect: {', '.join(o_data.get('key_moves', {}).get('kill', [])[:3])}"
                 char_context += f"\n- Tips against them: {', '.join(o_data.get('tips_against', [])[:2])}"
-        
-        context = f"""Analyze this Smash Ultimate match and provide coaching. Always refer to the player as "you."
+
+        # Skill and habit context for calibrated coaching
+        skill_context = ""
+        if skill_profile:
+            tier = skill_profile.get("tier", "mid")
+            score = skill_profile.get("overall_score", 0)
+            strengths = skill_profile.get("strengths", [])
+            weaknesses = skill_profile.get("weaknesses", [])
+            skill_context = f"\nSKILL ASSESSMENT: {tier.upper()} level (score: {score:.0f}/100)"
+            if strengths:
+                skill_context += f"\n- Strengths: {', '.join(strengths)}"
+            if weaknesses:
+                skill_context += f"\n- Areas to improve: {', '.join(weaknesses)}"
+
+            tier_instruction = {
+                "low": "\nCALIBRATION: This player is a beginner. Use simple language, focus on fundamentals (spacing, shielding, not rushing in). Avoid frame data or advanced tech.",
+                "mid": "\nCALIBRATION: This player is intermediate. Give specific option-select advice, mention DI, and suggest concrete counterplay. Avoid over-simplifying.",
+                "high": "\nCALIBRATION: This player is advanced. Discuss option coverage, frame advantage, conditioning, and matchup-specific counterplay. Be precise.",
+                "top": "\nCALIBRATION: This player is competitive-level. Discuss frame data, DI mixup percentages, micro-spacing, and reads. Assume deep game knowledge.",
+            }
+            skill_context += tier_instruction.get(tier, "")
+
+        habit_context = ""
+        if habit_report and habit_report.get("habits"):
+            habit_lines = []
+            for h in habit_report["habits"][:3]:
+                habit_lines.append(f"- [{h['severity'].upper()}] {h['description']}: {h['evidence']}")
+            habit_context = "\nDETECTED HABITS:\n" + "\n".join(habit_lines)
+
+        p_name = player_char or "unknown"
+        o_name = opponent_char or "unknown"
+
+        context = f"""CHARACTERS (MANDATORY — only reference these two):
+- You are playing: {p_name}
+- Opponent: {o_name}
+Do NOT mention any other characters by name.
+
+Analyze this Smash Ultimate match and provide coaching. Always refer to the player as "you."
 
 MATCH STATS:
 - Duration: {mins}:{secs:02d}
 - Your max damage taken: {stats.get('p1_max_percent', 0)}%
 - Opponent max damage: {stats.get('p2_max_percent', 0)}%
 - Result: {"You won" if you_won else "You lost"}
-{char_context}
+{char_context}{skill_context}{habit_context}
 
 KEY MOMENTS:
 - Damage spikes (you took heavy damage): {len(damage_spikes)} times
@@ -861,22 +1567,29 @@ KEY MOMENTS:
 - Long neutral exchanges: {len(patterns.get('long_neutral', []))}
 
 Provide:
-1. A 2-3 sentence encouraging but honest summary, tailored to this matchup if characters are known.
-2. The single most important thing to focus on improving (specific and actionable).
-3. One character-specific tip: something to do more of or avoid when playing your character vs this opponent.
+1. A 2-3 sentence encouraging but honest summary, calibrated to the player's skill level and detected habits.
+2. The single most important thing to focus on improving (specific and actionable, based on weaknesses and habits).
+3. One character-specific tip: something to do more of or avoid when playing {p_name} vs {o_name}.
 
 Keep it concise and actionable. Speak directly to the player."""
+
+        system_content = (
+            f"You are a friendly Smash Ultimate coach. Give specific, actionable advice. "
+            f"CRITICAL: The player is playing {p_name} against {o_name}. "
+            f"You MUST ONLY mention these two characters. Never reference any other character."
+        )
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a friendly Smash Ultimate coach. Give specific, actionable advice. Reference character names and key moves when possible."},
+                {"role": "system", "content": system_content},
                 {"role": "user", "content": context}
             ],
             max_tokens=350
         )
-        
+
         ai_summary = response.choices[0].message.content
+        ai_summary = _validate_character_names(ai_summary, player_char, opponent_char)
         
         # Enhance each tip with detailed, character-specific suggestions
         enhanced_tips = enhance_tips_with_ai(client, tips, player_char, opponent_char)

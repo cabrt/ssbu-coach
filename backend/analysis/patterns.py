@@ -382,33 +382,31 @@ def find_patterns(game_states: list) -> dict:
             # This catches the game-ending death even if stock detection fails
             if (prev_p1_percent is not None and prev_p1_percent >= 60 and 
                 state.get("p1_percent") is None):
-                # Check if this is near the end of the video (within last 20% of frames)
-                if i >= len(smoothed_states) * 0.8:
-                    # This is likely the final death
-                    if not patterns.get("stock_losses") or all(l["timestamp"] < timestamp - 5 for l in patterns["stock_losses"]):
+                # Near end of video (last 25% of frames) - do not require frames after death
+                if i >= len(smoothed_states) * 0.75:
+                    # Add final death if no stock_loss within 2s of this timestamp
+                    recent = [l for l in patterns.get("stock_losses", []) if l["timestamp"] >= timestamp - 2]
+                    if not recent:
                         patterns["stock_losses"].append({
                             "timestamp": timestamp,
                             "percent": prev_p1_percent,
-                            "stocks_remaining": 0,  # final death
+                            "stocks_remaining": 0,
                             "is_game_ender": True
                         })
                         patterns["game_end"] = timestamp
                         game_over = True
             
             # detect OPPONENT final KO: when opponent percent goes to None while at high percent
-            # This catches the game-ending kill even if stock detection fails  
-            # BUT only if game hasn't ended from P1 death
             if not game_over:
                 if (prev_p2_percent is not None and prev_p2_percent >= 60 and 
                     state.get("p2_percent") is None):
-                    # Check if this is near the end of the video (within last 20% of frames)
-                    if i >= len(smoothed_states) * 0.8:
-                        # This is likely the final KO
-                        if not patterns.get("kills") or all(k["timestamp"] < timestamp - 5 for k in patterns["kills"]):
+                    if i >= len(smoothed_states) * 0.75:
+                        recent = [k for k in patterns.get("kills", []) if k["timestamp"] >= timestamp - 2]
+                        if not recent:
                             patterns["kills"].append({
                                 "timestamp": timestamp,
                                 "opponent_percent": prev_p2_percent,
-                                "opponent_stocks_remaining": 0,  # final KO
+                                "opponent_stocks_remaining": 0,
                                 "is_game_winner": True
                             })
                             patterns["game_end"] = timestamp
@@ -614,31 +612,56 @@ def find_patterns(game_states: list) -> dict:
         prev_p2_percent = p2_percent
     
     # Deduplicate stock events - only keep one per actual stock loss
-    # Stock events within 5 seconds of each other are the same event
-    patterns["stock_losses"] = _deduplicate_events(patterns["stock_losses"], time_window=5.0)
-    patterns["kills"] = _deduplicate_events(patterns["kills"], time_window=5.0)
+    # NEVER remove the only final-stock event (0 stocks remaining)
+    patterns["stock_losses"] = _deduplicate_events(
+        patterns["stock_losses"], time_window=5.0, final_stock_key="stocks_remaining"
+    )
+    patterns["kills"] = _deduplicate_events(
+        patterns["kills"], time_window=5.0, final_stock_key="opponent_stocks_remaining"
+    )
     
     # Track global max percents (not affected by resets after deaths)
     patterns["p1_true_max_percent"] = global_p1_max
     patterns["p2_true_max_percent"] = global_p2_max
-    
+
+    # --- Phase tracking (additive, does not modify any existing detection) ---
+    patterns["game_phases"] = _compute_game_phases(
+        smoothed_states, patterns, game_start_time
+    )
+    patterns["after_death_phases"] = _compute_after_death_phases(
+        smoothed_states, patterns, game_start_time
+    )
+    patterns["stage_control_timeline"] = _compute_stage_control(
+        smoothed_states, game_start_time
+    )
+
     return patterns
 
 
-def _deduplicate_events(events: list, time_window: float = 5.0) -> list:
-    """Remove duplicate events within a time window, keeping the first one."""
+def _deduplicate_events(events: list, time_window: float = 5.0, final_stock_key: str = None) -> list:
+    """
+    Remove duplicate events within a time window, keeping the first one.
+    NEVER remove the only final-stock event (stocks_remaining/opponent_stocks_remaining == 0).
+    """
     if not events:
         return events
     
     # Sort by timestamp
     sorted_events = sorted(events, key=lambda x: x.get("timestamp", 0))
+    final_events = [e for e in sorted_events if (final_stock_key and e.get(final_stock_key) == 0)]
     
     deduplicated = []
     last_timestamp = -999
     
     for event in sorted_events:
         ts = event.get("timestamp", 0)
-        # If this event is more than time_window after the last one, keep it
+        is_final = final_stock_key and event.get(final_stock_key) == 0
+        # Always keep final-stock events (game-ender)
+        if is_final:
+            deduplicated.append(event)
+            if ts > last_timestamp:
+                last_timestamp = ts
+            continue
         if ts - last_timestamp > time_window:
             deduplicated.append(event)
             last_timestamp = ts
@@ -675,13 +698,21 @@ def smooth_game_states(game_states: list) -> list:
             smoothed_state["p2_percent"] = int(sorted(p2_percents)[len(p2_percents) // 2])
         
         # smooth stock counts using mode (most common value in window)
+        # CRITICAL: never smooth away 0 stocks (final death) - preserve raw 0 from validator
         p1_stocks = [s.get("p1_stocks") for s in window if s.get("p1_stocks") is not None]
         p2_stocks = [s.get("p2_stocks") for s in window if s.get("p2_stocks") is not None]
-        
         if p1_stocks:
-            smoothed_state["p1_stocks"] = max(set(p1_stocks), key=p1_stocks.count)
+            mode_p1 = max(set(p1_stocks), key=p1_stocks.count)
+            if state.get("p1_stocks") == 0:
+                smoothed_state["p1_stocks"] = 0  # preserve final death
+            else:
+                smoothed_state["p1_stocks"] = mode_p1
         if p2_stocks:
-            smoothed_state["p2_stocks"] = max(set(p2_stocks), key=p2_stocks.count)
+            mode_p2 = max(set(p2_stocks), key=p2_stocks.count)
+            if state.get("p2_stocks") == 0:
+                smoothed_state["p2_stocks"] = 0  # preserve final kill
+            else:
+                smoothed_state["p2_stocks"] = mode_p2
         
         smoothed.append(smoothed_state)
     
@@ -883,12 +914,15 @@ def detect_stock_loss(game_states: list, current_idx: int, player: str,
     
     # Relaxed requirement near end of video (final death may not have many frames after)
     required_persisting = 1 if near_end_of_video else 4
+    # At end of video we may have 0 future frames - still accept final death (current_stocks == 0)
+    if near_end_of_video and current_stocks == 0 and frames_to_check < required_persisting:
+        return {"new_stocks": 0, "death_percent": max_recent_percent}
     if persisting_low_stock < required_persisting and frames_to_check >= required_persisting:
         return None
     
     # If going to 0 stocks (final death), skip percent reset check - game ends
     if current_stocks == 0:
-        return {"new_stocks": current_stocks}
+        return {"new_stocks": current_stocks, "death_percent": max_recent_percent}
     
     # validation 4: percent MUST reset to <15% within the next few frames
     percent_reset_confirmed = False
@@ -917,18 +951,18 @@ def detect_combos(game_states: list) -> list:
     combos = []
     combo_start = None
     combo_damage = 0
-    
+
     for i, state in enumerate(game_states):
         if i == 0:
             continue
-        
+
         prev = game_states[i-1]
         p2_percent = state.get("p2_percent") or 0
         prev_p2 = prev.get("p2_percent") or 0
-        
+
         damage = p2_percent - prev_p2
         time_diff = state["timestamp"] - prev["timestamp"]
-        
+
         # if we dealt damage quickly, might be a combo
         if damage > 0 and time_diff < 2:
             if combo_start is None:
@@ -945,5 +979,237 @@ def detect_combos(game_states: list) -> list:
                 })
             combo_start = None
             combo_damage = 0
-    
+
     return combos
+
+
+# ---------------------------------------------------------------------------
+# Game-phase helpers (Phase 2 of coaching upgrade)
+# ---------------------------------------------------------------------------
+
+def _compute_game_phases(
+    smoothed_states: list, patterns: dict, game_start_time: float
+) -> list:
+    """
+    Segment the match into phases: neutral, advantage, disadvantage, after_death.
+
+    Phases are derived from the damage flow between existing events.
+    A 3-second sliding window determines which player is dealing/taking damage.
+    """
+    if len(smoothed_states) < 3:
+        return []
+
+    # Collect death timestamps for after_death tagging (5-second windows)
+    death_times = sorted(
+        sl.get("timestamp", 0) for sl in patterns.get("stock_losses", [])
+    )
+
+    phases = []
+    current_phase = "neutral"
+    phase_start = game_start_time
+    phase_dmg_dealt = 0.0
+    phase_dmg_taken = 0.0
+    WINDOW = 3.0  # seconds
+
+    prev_p1 = 0
+    prev_p2 = 0
+
+    for i, state in enumerate(smoothed_states):
+        ts = state["timestamp"]
+        if ts < game_start_time:
+            continue
+
+        p1_pct = state.get("p1_percent") or 0
+        p2_pct = state.get("p2_percent") or 0
+        dmg_taken = max(0, p1_pct - prev_p1) if p1_pct >= prev_p1 else 0
+        dmg_dealt = max(0, p2_pct - prev_p2) if p2_pct >= prev_p2 else 0
+        # Cap per-frame deltas to reject OCR noise
+        dmg_taken = min(dmg_taken, 60)
+        dmg_dealt = min(dmg_dealt, 60)
+
+        phase_dmg_dealt += dmg_dealt
+        phase_dmg_taken += dmg_taken
+
+        # Determine phase from damage flow
+        in_after_death = any(0 <= (ts - dt) <= 5 for dt in death_times)
+        if in_after_death:
+            new_phase = "after_death"
+        elif phase_dmg_dealt > phase_dmg_taken + 10:
+            new_phase = "advantage"
+        elif phase_dmg_taken > phase_dmg_dealt + 10:
+            new_phase = "disadvantage"
+        else:
+            new_phase = "neutral"
+
+        # Transition?
+        if new_phase != current_phase and (ts - phase_start) >= 1.0:
+            phases.append({
+                "start": round(phase_start, 2),
+                "end": round(ts, 2),
+                "phase": current_phase,
+                "damage_dealt": round(phase_dmg_dealt, 1),
+                "damage_taken": round(phase_dmg_taken, 1),
+            })
+            current_phase = new_phase
+            phase_start = ts
+            phase_dmg_dealt = 0.0
+            phase_dmg_taken = 0.0
+
+        # Reset rolling counters on window boundary
+        if (ts - phase_start) > WINDOW:
+            phase_dmg_dealt *= 0.5
+            phase_dmg_taken *= 0.5
+
+        prev_p1 = p1_pct
+        prev_p2 = p2_pct
+
+    # Close final phase
+    if smoothed_states:
+        final_ts = smoothed_states[-1]["timestamp"]
+        if final_ts > phase_start:
+            phases.append({
+                "start": round(phase_start, 2),
+                "end": round(final_ts, 2),
+                "phase": current_phase,
+                "damage_dealt": round(phase_dmg_dealt, 1),
+                "damage_taken": round(phase_dmg_taken, 1),
+            })
+
+    return phases
+
+
+def _compute_after_death_phases(
+    smoothed_states: list, patterns: dict, game_start_time: float
+) -> list:
+    """
+    For each stock loss, track what happened in the next 5 seconds:
+    damage taken, damage dealt, time to first interaction, behavior tag.
+    """
+    stock_losses = patterns.get("stock_losses", [])
+    if not stock_losses or not smoothed_states:
+        return []
+
+    results = []
+    for sl in stock_losses:
+        # Skip final death (no respawn)
+        if sl.get("stocks_remaining", 1) == 0:
+            continue
+
+        death_ts = sl.get("timestamp", 0)
+        window_start = death_ts + 0.5  # skip death animation
+        window_end = death_ts + 5.0
+
+        dmg_taken = 0.0
+        dmg_dealt = 0.0
+        first_interaction_ts = None
+        prev_p1 = None
+        prev_p2 = None
+
+        for state in smoothed_states:
+            ts = state["timestamp"]
+            if ts < window_start:
+                prev_p1 = state.get("p1_percent") or 0
+                prev_p2 = state.get("p2_percent") or 0
+                continue
+            if ts > window_end:
+                break
+
+            p1_pct = state.get("p1_percent") or 0
+            p2_pct = state.get("p2_percent") or 0
+
+            if prev_p1 is not None:
+                dt = max(0, p1_pct - prev_p1) if p1_pct >= prev_p1 else 0
+                dd = max(0, p2_pct - prev_p2) if p2_pct >= prev_p2 else 0
+                dt = min(dt, 60)
+                dd = min(dd, 60)
+                dmg_taken += dt
+                dmg_dealt += dd
+
+                if first_interaction_ts is None and (dt > 3 or dd > 3):
+                    first_interaction_ts = ts
+
+            prev_p1 = p1_pct
+            prev_p2 = p2_pct
+
+        time_to_interact = (
+            round(first_interaction_ts - death_ts, 2)
+            if first_interaction_ts else None
+        )
+
+        # Classify behavior
+        if dmg_taken > 25 and dmg_dealt < 10:
+            behavior = "panic"
+        elif dmg_dealt > dmg_taken + 10:
+            behavior = "aggressive"
+        elif dmg_taken < 10 and dmg_dealt < 10:
+            behavior = "composed"
+        else:
+            behavior = "neutral"
+
+        results.append({
+            "death_timestamp": round(death_ts, 2),
+            "damage_taken": round(dmg_taken, 1),
+            "damage_dealt": round(dmg_dealt, 1),
+            "time_to_first_interaction": time_to_interact,
+            "behavior": behavior,
+            "stocks_remaining": sl.get("stocks_remaining"),
+        })
+
+    return results
+
+
+def _compute_stage_control(
+    smoothed_states: list, game_start_time: float
+) -> list:
+    """
+    Rolling 3-second damage-flow snapshot sampled every 1 second.
+    Positive control_score = you dominating, negative = opponent dominating.
+    """
+    if len(smoothed_states) < 3:
+        return []
+
+    SAMPLE_INTERVAL = 1.0
+    WINDOW = 3.0
+    timeline = []
+
+    # Pre-compute per-frame damage deltas
+    deltas = []
+    for i, state in enumerate(smoothed_states):
+        if i == 0 or state["timestamp"] < game_start_time:
+            deltas.append((state["timestamp"], 0.0, 0.0))
+            continue
+        prev = smoothed_states[i - 1]
+        p1 = state.get("p1_percent") or 0
+        p2 = state.get("p2_percent") or 0
+        pp1 = prev.get("p1_percent") or 0
+        pp2 = prev.get("p2_percent") or 0
+
+        dt = min(60, max(0, p1 - pp1)) if p1 >= pp1 else 0
+        dd = min(60, max(0, p2 - pp2)) if p2 >= pp2 else 0
+        deltas.append((state["timestamp"], dd, dt))  # (ts, you_dealt, you_took)
+
+    # Sample at 1-second intervals
+    if not deltas:
+        return []
+    start_ts = max(game_start_time, deltas[0][0])
+    end_ts = deltas[-1][0]
+    sample_ts = start_ts
+
+    while sample_ts <= end_ts:
+        window_dealt = 0.0
+        window_taken = 0.0
+        for ts, dd, dt in deltas:
+            if sample_ts - WINDOW <= ts <= sample_ts:
+                window_dealt += dd
+                window_taken += dt
+
+        control = round(window_dealt - window_taken, 1)
+        timeline.append({
+            "timestamp": round(sample_ts, 2),
+            "damage_dealt": round(window_dealt, 1),
+            "damage_taken": round(window_taken, 1),
+            "control_score": control,
+        })
+        sample_ts += SAMPLE_INTERVAL
+
+    return timeline

@@ -1,9 +1,11 @@
 from fastapi import APIRouter, UploadFile, File, BackgroundTasks, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
 import os
+import re
 import uuid
 import shutil
 import sys
+import subprocess
 from pathlib import Path
 
 # add backend dir to path for imports
@@ -27,6 +29,9 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 SAVED_ANALYSES_DIR = Path(__file__).parent.parent.parent / "data" / "saved_analyses"
 SAVED_ANALYSES_DIR.mkdir(parents=True, exist_ok=True)
+
+CLIPS_DIR = Path(__file__).parent.parent.parent / "data" / "clips"
+CLIPS_DIR.mkdir(parents=True, exist_ok=True)
 
 # store analysis results in memory (would use db in production)
 analyses = {}
@@ -145,14 +150,21 @@ def _run_analysis_sync(video_id: str, video_path: str, player_char: str = None, 
         
         # Update progress incrementally during analysis
         analyses[video_id]["progress"] = 75
-        coaching = generate_coaching(game_states, player_char=player_char, opponent_char=opponent_char, you_are_p1=you_are_p1)
+        coaching = generate_coaching(
+            game_states,
+            player_char=player_char,
+            opponent_char=opponent_char,
+            you_are_p1=you_are_p1,
+            video_path=video_path,
+        )
         
         analyses[video_id]["progress"] = 85
         analyses[video_id]["eta_seconds"] = 30
         
         # Enhance key tips with Vision API context (damage taken and combos)
         coaching = enhance_tips_with_vision(
-            coaching, video_path, player_char, opponent_char, you_are_p1
+            coaching, video_path, player_char, opponent_char, you_are_p1,
+            game_states=game_states,
         )
         
         analyses[video_id]["progress"] = 95
@@ -175,55 +187,117 @@ def _run_analysis_sync(video_id: str, video_path: str, player_char: str = None, 
         analyses[video_id] = {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
 
 
-def enhance_tips_with_vision(coaching: dict, video_path: str, player_char: str, opponent_char: str, you_are_p1: bool) -> dict:
+def enhance_tips_with_vision(coaching: dict, video_path: str, player_char: str, opponent_char: str, you_are_p1: bool, game_states: list = None) -> dict:
     """
-    Enhance damage_taken and combo tips with Vision API analysis.
-    Analyzes frames to identify specific moves and provide detailed context.
+    Enhance tips with Vision API analysis.
+    Uses multi-frame sequences for top events and single-frame for remaining.
     """
     import os
     import cv2
     import base64
-    
+
     if not os.getenv("OPENAI_API_KEY") or not video_path or not os.path.exists(video_path):
         return coaching
-    
+
     from openai import OpenAI
     client = OpenAI()
-    
+
+    tips = coaching.get("tips", [])
+    skill_tier = None
+    sp = coaching.get("skill_profile")
+    if sp:
+        skill_tier = sp.get("tier")
+
+    # --- Multi-frame enhancement for top events ---
+    multi_frame_indices = set()
+    try:
+        from cv.event_context import extract_event_frame_sequences, build_sequence_vision_prompt
+        sequences = extract_event_frame_sequences(video_path, tips, max_events=8)
+
+        for seq in sequences:
+            tip_idx = seq.get("tip_index")
+            if tip_idx is None or tip_idx >= len(tips):
+                continue
+
+            tip = tips[tip_idx]
+            try:
+                text_prompt, image_parts = build_sequence_vision_prompt(
+                    seq, tip,
+                    skill_tier=skill_tier,
+                    player_char=player_char,
+                    opponent_char=opponent_char,
+                    game_states=game_states,
+                    you_are_p1=you_are_p1,
+                )
+
+                # Build messages with interleaved text + images
+                content_parts = [{"type": "text", "text": text_prompt}]
+                for img in image_parts:
+                    content_parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{img['mime_type']};base64,{img['data']}"},
+                    })
+
+                response = client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {"role": "system", "content": "You are a Smash Ultimate coach analyzing gameplay frame sequences. Give specific, actionable advice. Be concise."},
+                        {"role": "user", "content": content_parts},
+                    ],
+                    max_tokens=250,
+                )
+
+                enhanced_message = response.choices[0].message.content.strip()
+
+                # Parse kill move from stock_lost vision responses
+                if tip.get("type") == "stock_lost":
+                    kill_match = re.match(r"KILL MOVE:\s*(.+?)(?:\n|$)", enhanced_message, re.IGNORECASE)
+                    if kill_match:
+                        tip["kill_move_identified"] = kill_match.group(1).strip()
+                        enhanced_message = re.sub(r"KILL MOVE:\s*.+?(?:\n|$)", "", enhanced_message, count=1).strip()
+
+                original_msg = tip.get("message", "")
+                tip["message"] = f"{original_msg}\n\n{enhanced_message}"
+                tip["enhanced"] = True
+                tip["multi_frame"] = True
+                multi_frame_indices.add(tip_idx)
+
+            except Exception as e:
+                print(f"[Vision] Multi-frame enhancement failed for tip {tip_idx}: {e}")
+
+    except ImportError:
+        print("[Vision] event_context module not available, falling back to single-frame")
+
+    # --- Single-frame fallback for remaining damage_taken / combo tips ---
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
-    
-    enhanced_tips = []
-    
-    for tip in coaching.get("tips", []):
+
+    for idx, tip in enumerate(tips):
+        if idx in multi_frame_indices:
+            continue  # already enhanced with multi-frame
+
         tip_type = tip.get("type", "")
         timestamp = tip.get("timestamp", 0)
-        
-        # Only enhance damage_taken and combo tips
+
         if tip_type not in ["damage_taken", "combo"]:
-            enhanced_tips.append(tip)
             continue
-        
+
         try:
-            # Extract frame at this timestamp
             frame_num = int(timestamp * fps)
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
             ret, frame = cap.read()
-            
+
             if not ret:
-                enhanced_tips.append(tip)
                 continue
-            
-            # Resize for API
+
             h, w = frame.shape[:2]
             if w > 1280:
                 scale = 1280 / w
                 frame = cv2.resize(frame, (1280, int(h * scale)))
-            
+
             _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
             frame_base64 = base64.b64encode(buffer).decode('utf-8')
-            
-            # Different prompts for damage taken vs combos
+
             if tip_type == "damage_taken":
                 prompt = f"""Analyze this Super Smash Bros Ultimate frame. The player ({player_char}) just took damage from the opponent ({opponent_char}).
 
@@ -243,7 +317,7 @@ Based on what you see:
 3. Any tips to optimize this combo for more damage or a kill?
 
 Respond in 2-3 sentences max, directly addressing the player. Be specific about moves."""
-            
+
             response = client.chat.completions.create(
                 model="gpt-4o",
                 messages=[
@@ -255,22 +329,32 @@ Respond in 2-3 sentences max, directly addressing the player. Be specific about 
                 ],
                 max_tokens=200
             )
-            
+
             enhanced_message = response.choices[0].message.content.strip()
-            
-            # Combine original tip with enhanced context
             original_msg = tip.get("message", "")
             tip["message"] = f"{original_msg}\n\n{enhanced_message}"
             tip["enhanced"] = True
-            
+
         except Exception as e:
-            # If enhancement fails, keep original tip
             print(f"Vision enhancement failed for tip at {timestamp}s: {e}")
-        
-        enhanced_tips.append(tip)
-    
+
     cap.release()
-    coaching["tips"] = enhanced_tips
+
+    # Update opponent report deaths with vision-identified kill moves
+    opponent_report = coaching.get("opponent_report")
+    if opponent_report and opponent_report.get("deaths"):
+        for tip in tips:
+            kill_move = tip.get("kill_move_identified")
+            if not kill_move or tip.get("type") != "stock_lost":
+                continue
+            tip_ts = tip.get("timestamp", 0)
+            for death in opponent_report["deaths"]:
+                # Match by kill percent (approximate timestamp match)
+                if abs(death.get("kill_percent", 0) - tip.get("percent", 0)) < 5:
+                    death["description"] += f" (likely {kill_move})"
+                    death["kill_move"] = kill_move
+                    break
+
     return coaching
 
 
@@ -684,5 +768,180 @@ async def get_video(video_id: str):
                     media_type="video/mp4",
                     filename=os.path.basename(video_path)
                 )
-    
+
     raise HTTPException(404, "Video not found")
+
+
+# --- Feature 4: Cross-Session Trend Tracking ---
+
+@router.get("/trends")
+async def list_trend_characters():
+    """Return list of characters that have saved analyses."""
+    char_counts = {}
+    for f in SAVED_ANALYSES_DIR.glob("*.json"):
+        try:
+            with open(f) as fp:
+                data = json.load(fp)
+                char = data.get("player_char")
+                if char:
+                    char_counts[char] = char_counts.get(char, 0) + 1
+        except Exception:
+            pass
+    return {"characters": [{"name": c, "games": n} for c, n in sorted(char_counts.items(), key=lambda x: -x[1])]}
+
+
+@router.get("/trends/{character}")
+async def get_character_trends(character: str):
+    """Return skill metrics over time for a character, plus comparison to previous average."""
+    games = []
+    for f in sorted(SAVED_ANALYSES_DIR.glob("*.json")):
+        try:
+            with open(f) as fp:
+                data = json.load(fp)
+                if (data.get("player_char") or "").lower() != character.lower():
+                    continue
+                coaching = data.get("coaching", {})
+                sp = coaching.get("skill_profile")
+                if not sp:
+                    continue
+                stats = coaching.get("stats", {})
+                games.append({
+                    "video_id": data.get("video_id"),
+                    "saved_at": data.get("saved_at"),
+                    "overall_score": sp.get("overall_score", 0),
+                    "tier": sp.get("tier", "mid"),
+                    "you_won": stats.get("you_won", False),
+                    "opponent_char": data.get("opponent_char"),
+                    "metrics": {
+                        k: v.get("score", 0)
+                        for k, v in sp.get("metrics", {}).items()
+                    },
+                })
+        except Exception:
+            pass
+
+    if not games:
+        return {"character": character, "games_played": 0, "games": [], "comparison": {}}
+
+    # Sort by saved_at
+    games.sort(key=lambda g: g.get("saved_at") or "")
+
+    # Compute comparison: latest game vs previous average
+    comparison = {}
+    if len(games) >= 2:
+        latest = games[-1]
+        prev_games = games[:-1]
+        for metric_key in latest.get("metrics", {}):
+            prev_vals = [g["metrics"].get(metric_key, 0) for g in prev_games if metric_key in g.get("metrics", {})]
+            if prev_vals:
+                prev_avg = sum(prev_vals) / len(prev_vals)
+                current = latest["metrics"][metric_key]
+                comparison[metric_key] = {
+                    "current": round(current, 1),
+                    "previous_avg": round(prev_avg, 1),
+                    "delta": round(current - prev_avg, 1),
+                }
+
+        # Overall score comparison
+        prev_scores = [g["overall_score"] for g in prev_games]
+        comparison["overall_score"] = {
+            "current": round(latest["overall_score"], 1),
+            "previous_avg": round(sum(prev_scores) / len(prev_scores), 1),
+            "delta": round(latest["overall_score"] - sum(prev_scores) / len(prev_scores), 1),
+        }
+
+    wins = sum(1 for g in games if g.get("you_won"))
+    return {
+        "character": character,
+        "games_played": len(games),
+        "win_rate": round(wins / len(games) * 100, 1) if games else 0,
+        "games": games,
+        "comparison": comparison,
+    }
+
+
+# --- Feature 5: Clip Export ---
+
+def _find_video_path(video_id: str) -> str:
+    """Find the video file path from in-memory analyses or saved JSON."""
+    if video_id in analyses:
+        vp = analyses[video_id].get("video_path")
+        if vp and os.path.exists(vp):
+            return vp
+
+    save_path = SAVED_ANALYSES_DIR / f"{video_id}.json"
+    if save_path.exists():
+        with open(save_path) as fp:
+            data = json.load(fp)
+            vp = data.get("video_path")
+            if vp and os.path.exists(vp):
+                return vp
+
+    return None
+
+
+@router.get("/clip/{video_id}/{timestamp}")
+async def export_clip(video_id: str, timestamp: float):
+    """Extract a 5-second clip (2s before, 3s after) from the video."""
+    video_path = _find_video_path(video_id)
+    if not video_path:
+        raise HTTPException(404, "Video not found")
+
+    start = max(0, timestamp - 2)
+    clip_filename = f"{video_id}_{int(timestamp)}.mp4"
+    clip_path = CLIPS_DIR / clip_filename
+
+    # Return cached clip if it exists
+    if clip_path.exists():
+        return FileResponse(
+            str(clip_path),
+            media_type="video/mp4",
+            filename=clip_filename,
+            headers={"Content-Disposition": f'attachment; filename="{clip_filename}"'},
+        )
+
+    # Try stream copy first (instant), fall back to re-encode
+    ffmpeg = "/opt/homebrew/bin/ffmpeg"
+    if not os.path.exists(ffmpeg):
+        ffmpeg = "ffmpeg"
+
+    cmd_copy = [
+        ffmpeg, "-y",
+        "-ss", str(start),
+        "-i", video_path,
+        "-t", "5",
+        "-c", "copy",
+        str(clip_path),
+    ]
+
+    try:
+        result = subprocess.run(cmd_copy, capture_output=True, timeout=30)
+        # Verify output file is valid (> 1KB)
+        if not clip_path.exists() or clip_path.stat().st_size < 1024:
+            raise Exception("Stream copy produced invalid file")
+    except Exception:
+        # Fallback: re-encode
+        cmd_encode = [
+            ffmpeg, "-y",
+            "-ss", str(start),
+            "-i", video_path,
+            "-t", "5",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-c:a", "aac",
+            str(clip_path),
+        ]
+        try:
+            subprocess.run(cmd_encode, capture_output=True, timeout=60)
+        except Exception as e:
+            raise HTTPException(500, f"Clip extraction failed: {e}")
+
+    if not clip_path.exists():
+        raise HTTPException(500, "Clip extraction failed")
+
+    return FileResponse(
+        str(clip_path),
+        media_type="video/mp4",
+        filename=clip_filename,
+        headers={"Content-Disposition": f'attachment; filename="{clip_filename}"'},
+    )
